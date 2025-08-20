@@ -7,7 +7,6 @@ import os
 import time
 import random
 import plotly.express as px
-import threading
 
 # File paths
 TICKERS_FILE = 'tickers.txt'
@@ -341,12 +340,10 @@ def analyze_stocks(tickers, status_placeholder, progress_bar):
         df = pd.DataFrame.from_dict(results, orient='index')
         df['Last Updated'] = pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')
         df.to_csv(CACHE_FILE, index_label='Ticker')
-        st.session_state.df = df
-        status_placeholder.success(f"Background refresh complete! Processed {len(results)}/{total} tickers.")
+        return df
     else:
         status_placeholder.error("No data processed. Check error_log.txt for details.")
-    
-    st.session_state.refreshing = False  # Allow new refresh
+        return None
 
 # Load from cache
 def load_cache():
@@ -439,10 +436,6 @@ st.set_page_config(page_title="Stock Analysis & Paper Trading App", layout="wide
 
 st.title("Stock Analysis & Paper Trading App (3-Year Weekly Data, Sector Comparison)")
 
-# Initialize session state
-if 'refreshing' not in st.session_state:
-    st.session_state.refreshing = False
-
 # Load tickers
 try:
     tickers = load_tickers()
@@ -465,14 +458,16 @@ with tab1:
     cached_df = load_cache()
     if cached_df is not None:
         last_updated = cached_df['Last Updated'].iloc[0] if 'Last Updated' in cached_df.columns else "Unknown"
-        st.info(f"Showing cached data (last updated: {last_updated}). Click 'Refresh Data' to update in background.")
+        st.info(f"Showing cached data (last updated: {last_updated}). Click 'Refresh Data' to update.")
     
     # Refresh button
-    if st.button("Refresh Data", disabled=st.session_state.refreshing):
-        st.session_state.refreshing = True
-        status_placeholder.info("Background refresh in progress... UI remains responsive.")
-        thread = threading.Thread(target=analyze_stocks, args=(tickers, status_placeholder, progress_bar))
-        thread.start()
+    if st.button("Refresh Data"):
+        status_placeholder.info("Processing data... UI will be unresponsive until complete.")
+        df = analyze_stocks(tickers, status_placeholder, progress_bar)
+        if df is not None:
+            st.session_state.df = df
+        else:
+            st.error("Analysis failed. Check error_log.txt for details.")
     
     # Load data
     if 'df' in st.session_state:
