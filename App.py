@@ -7,11 +7,13 @@ import os
 import time
 import random
 import plotly.express as px
+import threading
 
 # File paths
 TICKERS_FILE = 'tickers.txt'
 CACHE_FILE = 'analysis_cache.csv'
 PORTFOLIO_FILE = 'portfolio.json'
+ERROR_LOG_FILE = 'error_log.txt'
 
 # Load tickers
 def load_tickers():
@@ -19,6 +21,12 @@ def load_tickers():
         raise FileNotFoundError(f"{TICKERS_FILE} not found. Please create it with one ticker per line.")
     with open(TICKERS_FILE, 'r') as f:
         return [line.strip().upper() for line in f if line.strip()]
+
+# Log errors to file
+def log_error(message):
+    with open(ERROR_LOG_FILE, 'a') as f:
+        timestamp = pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')
+        f.write(f"[{timestamp}] {message}\n")
 
 # Fetch data with retry mechanism (3 years, weekly data)
 def get_data(ticker, retries=3):
@@ -35,6 +43,7 @@ def get_data(ticker, retries=3):
             if attempt < retries - 1:
                 time.sleep(5)
                 continue
+            log_error(f"Failed to fetch data for {ticker}: {e}")
             raise e
 
 # RSI calculation
@@ -261,11 +270,9 @@ def get_recommendation(f_score, t_score, ut_signal):
         return 'Hold'
 
 # Analyze stocks with progress
-def analyze_stocks(tickers):
+def analyze_stocks(tickers, status_placeholder):
     data_dict = {}
     results = {}
-    progress_bar = st.progress(0)
-    status_text = st.empty()
     total = len(tickers)
     
     for i, ticker in enumerate(tickers):
@@ -273,16 +280,17 @@ def analyze_stocks(tickers):
             hist, info = get_data(ticker)
             data_dict[ticker] = {'hist': hist, 'info': info}
         except Exception as e:
-            st.warning(f"Error fetching data for {ticker}: {e}")
+            status_placeholder.warning(f"Error fetching data for {ticker}: {e}")
+            log_error(f"Error fetching data for {ticker}: {e}")
             continue
         
         progress = (i + 1) / total
-        progress_bar.progress(progress)
-        status_text.text(f"Fetching data {i + 1}/{total}: {ticker}")
+        status_placeholder.progress(progress)
+        status_placeholder.text(f"Fetching data {i + 1}/{total}: {ticker}")
     
     if data_dict:
-        with st.spinner("Computing sector medians..."):
-            sector_medians = compute_sector_medians(data_dict)
+        status_placeholder.text("Computing sector medians...")
+        sector_medians = compute_sector_medians(data_dict)
         
         processed = 0
         for ticker, data in data_dict.items():
@@ -306,22 +314,25 @@ def analyze_stocks(tickers):
                     'TradingView Link': f"https://www.tradingview.com/chart/?symbol={ticker}" if rec in ['Buy', 'Sell'] else ''
                 }
             except Exception as e:
-                st.warning(f"Error computing scores for {ticker}: {e}")
+                status_placeholder.warning(f"Error computing scores for {ticker}: {e}")
+                log_error(f"Error computing scores for {ticker}: {e}")
                 continue
             
             processed += 1
             progress = processed / len(data_dict)
-            progress_bar.progress(progress)
-            status_text.text(f"Computing scores {processed}/{len(data_dict)}: {ticker}")
-    
-    status_text.text("Analysis complete!")
+            status_placeholder.progress(progress)
+            status_placeholder.text(f"Computing scores {processed}/{len(data_dict)}: {ticker}")
     
     if results:
         df = pd.DataFrame.from_dict(results, orient='index')
         df['Last Updated'] = pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')
         df.to_csv(CACHE_FILE, index_label='Ticker')
-        return df
-    return pd.DataFrame()
+        st.session_state.df = df
+        status_placeholder.success("Background refresh complete!")
+    else:
+        status_placeholder.error("No data processed. Check error_log.txt for details.")
+    
+    st.session_state.refreshing = False  # Allow new refresh
 
 # Load from cache
 def load_cache():
@@ -358,8 +369,9 @@ def view_portfolio():
                 'P&L': round(pnl, 2)
             })
             total_value += value
-        except:
-            st.warning(f"Error fetching price for {ticker}")
+        except Exception as e:
+            st.warning(f"Error fetching price for {ticker}: {e}")
+            log_error(f"Error fetching portfolio price for {ticker}: {e}")
     
     if df_holdings:
         st.dataframe(pd.DataFrame(df_holdings))
@@ -389,6 +401,7 @@ def buy_stock(ticker, shares):
         st.success(f"Bought {shares} shares of {ticker} @ ${price:.2f}")
     except Exception as e:
         st.error(f"Error buying {ticker}: {e}")
+        log_error(f"Error buying {ticker}: {e}")
 
 def sell_stock(ticker, shares):
     portfolio = st.session_state.portfolio
@@ -405,11 +418,16 @@ def sell_stock(ticker, shares):
         st.success(f"Sold {shares} shares of {ticker} @ ${price:.2f}")
     except Exception as e:
         st.error(f"Error selling {ticker}: {e}")
+        log_error(f"Error selling {ticker}: {e}")
 
 # Main Streamlit App
 st.set_page_config(page_title="Stock Analysis & Paper Trading App", layout="wide")
 
 st.title("Stock Analysis & Paper Trading App (3-Year Weekly Data, Sector Comparison)")
+
+# Initialize session state
+if 'refreshing' not in st.session_state:
+    st.session_state.refreshing = False
 
 # Load tickers
 try:
@@ -425,17 +443,23 @@ tab1, tab2 = st.tabs(["Stock Analysis", "Paper Trading"])
 with tab1:
     st.header("Stock Analysis")
     
+    # Status placeholder for background refresh
+    status_placeholder = st.empty()
+    
+    # Load cache on start
     cached_df = load_cache()
     if cached_df is not None:
         last_updated = cached_df['Last Updated'].iloc[0] if 'Last Updated' in cached_df.columns else "Unknown"
-        st.info(f"Showing cached data (last updated: {last_updated}). Click 'Refresh Data' for latest.")
+        st.info(f"Showing cached data (last updated: {last_updated}). Click 'Refresh Data' to update in background.")
     
-    if st.button("Refresh Data"):
-        with st.spinner("Refreshing data... This may take a while for 750 tickers."):
-            df = analyze_stocks(tickers)
-            if not df.empty:
-                st.session_state.df = df
+    # Refresh button
+    if st.button("Refresh Data", disabled=st.session_state.refreshing):
+        st.session_state.refreshing = True
+        status_placeholder.info("Background refresh in progress... UI remains responsive.")
+        thread = threading.Thread(target=analyze_stocks, args=(tickers, status_placeholder))
+        thread.start()
     
+    # Load data
     if 'df' in st.session_state:
         df = st.session_state.df
     elif cached_df is not None:
@@ -525,4 +549,4 @@ with tab2:
 # Footer
 st.markdown("---")
 st.markdown("**Note:** Uses yfinance for 3-year weekly data. Fundamentals are sector-adjusted. UT Bot uses a=3. Run with `streamlit run app.py`. Data cached in 'analysis_cache.csv'.")
-st.markdown("**Warning:** Processing 750 tickers may hit rate limits. If errors occur, try a smaller ticker list, wait a few hours, or use an alternative API (e.g., Alpha Vantage).")
+st.markdown("**Warning:** Processing 750 tickers may hit rate limits. Check error_log.txt for issues. Try a smaller ticker list, wait a few hours, or use an alternative API (e.g., Alpha Vantage).")
