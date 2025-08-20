@@ -25,7 +25,7 @@ def get_data(ticker, retries=3):
     for attempt in range(retries):
         try:
             stock = yf.Ticker(ticker)
-            hist = stock.history(period='3y', interval='1wk')  # Changed to 3 years
+            hist = stock.history(period='3y', interval='1wk')
             if hist.empty:
                 raise ValueError(f"No historical data for {ticker}")
             info = stock.info
@@ -352,7 +352,7 @@ def view_portfolio():
             df_holdings.append({
                 'Ticker': ticker,
                 'Shares': data['shares'],
-                'Avg Buy Price': round(data['avg_buy_price', 2),
+                'Avg Buy Price': round(data['avg_buy_price'], 2),
                 'Current Price': round(current_price, 2),
                 'Value': round(value, 2),
                 'P&L': round(pnl, 2)
@@ -443,6 +443,12 @@ with tab1:
     else:
         st.info("No data available. Click 'Refresh Data' to analyze stocks.")
         st.stop()
+    
+    # Cache expiration check
+    if 'Last Updated' in df.columns:
+        cache_age = (pd.Timestamp.now() - pd.to_datetime(df['Last Updated'].iloc[0])).total_seconds() / 3600
+        if cache_age > 24:
+            st.warning("Cached data is over 24 hours old. Please refresh.")
     
     # Filters in sidebar
     st.sidebar.header("Filters")
