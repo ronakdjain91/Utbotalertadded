@@ -4,9 +4,7 @@ import pandas as pd
 import numpy as np
 import json
 import os
-
-# Note: You need to install required libraries if not already installed:
-# pip install streamlit yfinance pandas numpy
+import time
 
 # File paths
 TICKERS_FILE = 'tickers.txt'  # Input file with one ticker per line
@@ -19,16 +17,27 @@ def load_tickers():
     with open(TICKERS_FILE, 'r') as f:
         return [line.strip().upper() for line in f if line.strip()]
 
-# Fetch data with error handling
+# Fetch data with error handling (weekly data)
 def get_data(ticker):
     stock = yf.Ticker(ticker)
-    hist = stock.history(period='2y')  # 2 years for SMA200 reliability
+    hist = stock.history(period='5y', interval='1wk')  # 5 years, weekly data
     if hist.empty:
         raise ValueError(f"No historical data for {ticker}")
     info = stock.info
     return hist, info
 
-# Technical scoring: Based on SMA200 crossover and MACD crossover
+# RSI calculation
+def rsi(series, period=14):
+    delta = series.diff(1)
+    gain = delta.where(delta > 0, 0)
+    loss = -delta.where(delta < 0, 0)
+    avg_gain = gain.rolling(window=period, min_periods=1).mean()
+    avg_loss = loss.rolling(window=period, min_periods=1).mean()
+    rs = avg_gain / avg_loss
+    rs = rs.replace([np.inf, -np.inf], np.nan).fillna(0)  # Handle division by zero
+    return 100 - (100 / (1 + rs))
+
+# Technical scoring: SMA200, MACD, RSI, Volume
 # Score normalized to 0-10
 def technical_score(hist):
     if len(hist) < 200:
@@ -48,38 +57,110 @@ def technical_score(hist):
     
     macd_score = 1 if macd_line.iloc[-1] > signal_line.iloc[-1] else -1
     
-    # Combined score: Average, shifted to 0-10 scale
-    raw_score = (sma_score + macd_score) / 2
+    # RSI score
+    rsi_val = rsi(close, 14).iloc[-1]
+    rsi_score = 1 if rsi_val > 50 else -1
+    
+    # Volume score
+    volume = hist['Volume']
+    vol_sma50 = volume.rolling(window=50).mean().iloc[-1]
+    vol_score = 1 if volume.iloc[-1] > vol_sma50 else -1
+    
+    # Combined score: Average of 4 criteria, shifted to 0-10 scale
+    raw_score = (sma_score + macd_score + rsi_score + vol_score) / 4
     normalized_score = (raw_score + 1) * 5  # From 0 to 10
     return normalized_score
 
-# Fundamental scoring: Based on multiple criteria
-# Criteria derived from standard fundamental analysis indicators
-# Each criterion scored from -1 to +2, total normalized to 0-10
-def fundamental_score(info):
+# UT Bot Alert Signal (translated from PineScript, sensitivity a=3, on weekly data)
+def ut_bot_signal(hist, a=3, c=10):
+    close = hist['Close']
+    high = hist['High']
+    low = hist['Low']
+    
+    # Compute True Range and ATR
+    prev_close = close.shift(1)
+    tr = pd.concat([high - low, abs(high - prev_close), abs(low - prev_close)], axis=1).max(axis=1)
+    atr = tr.rolling(window=c).mean()
+    
+    nloss = a * atr
+    
+    # Trailing Stop (xATRTrailingStop)
+    ts = pd.Series(np.nan, index=close.index)
+    for i in range(1, len(close)):
+        if pd.isna(ts[i-1]):
+            ts[i] = close[i] + nloss[i] if close[i] < close[i-1] else close[i] - nloss[i]
+        elif close[i] > ts[i-1] and close[i-1] > ts[i-1]:
+            ts[i] = max(ts[i-1], close[i] - nloss[i])
+        elif close[i] < ts[i-1] and close[i-1] < ts[i-1]:
+            ts[i] = min(ts[i-1], close[i] + nloss[i])
+        elif close[i] > ts[i-1]:
+            ts[i] = close[i] - nloss[i]
+        else:
+            ts[i] = close[i] + nloss[i]
+    
+    # Position (pos)
+    pos = pd.Series(0, index=close.index)
+    for i in range(1, len(close)):
+        if close[i-1] < ts[i-1] and close[i] > ts[i-1]:
+            pos[i] = 1
+        elif close[i-1] > ts[i-1] and close[i] < ts[i-1]:
+            pos[i] = -1
+        else:
+            pos[i] = pos[i-1]
+    
+    # Crossovers for buy/sell
+    above = (close > ts.shift(1)) & (close.shift(1) <= ts.shift(1))
+    below = (close < ts.shift(1)) & (close.shift(1) >= ts.shift(1))
+    
+    buy = (close > ts) & above
+    sell = (close < ts) & below
+    
+    # Latest signal
+    if buy.iloc[-1]:
+        return 'Buy'
+    elif sell.iloc[-1]:
+        return 'Sell'
+    elif pos.iloc[-1] == 1:
+        return 'Bullish'
+    elif pos.iloc[-1] == -1:
+        return 'Bearish'
+    else:
+        return 'Neutral'
+
+# Fundamental scoring: Sector comparison
+# Score each stock relative to its sector's median metrics
+def fundamental_score(ticker, info, sector_medians):
+    sector = info.get('sector', 'Unknown')
     scores = []
     
-    # 1. P/E Ratio (trailingPE)
+    # 1. P/E Ratio
     pe = info.get('trailingPE', np.nan)
-    if np.isnan(pe):
+    sector_pe = sector_medians.get(sector, {}).get('trailingPE', np.nan)
+    if np.isnan(pe) or np.isnan(sector_pe):
         scores.append(0)
-    elif pe < 15:
+    elif pe < sector_pe * 0.8:  # Better than sector
         scores.append(2)
-    elif pe < 25:
+    elif pe < sector_pe:
         scores.append(1)
-    elif pe < 40:
+    elif pe < sector_pe * 1.2:
         scores.append(0)
     else:
         scores.append(-1)
     
-    # 2. PEG Ratio (P/E divided by earnings growth rate)
-    earnings_growth = info.get('earningsGrowth', 0) * 100  # Convert to percent
+    # 2. PEG Ratio
+    earnings_growth = info.get('earningsGrowth', 0) * 100
+    sector_eg = sector_medians.get(sector, {}).get('earningsGrowth', 0) * 100
     if earnings_growth > 0 and not np.isnan(pe):
         peg = pe / earnings_growth
-        if peg < 1:
+        sector_peg = sector_pe / sector_eg if sector_eg > 0 else np.nan
+        if np.isnan(sector_peg):
+            scores.append(0)
+        elif peg < sector_peg * 0.8:
             scores.append(2)
-        elif peg < 2:
+        elif peg < sector_peg:
             scores.append(1)
+        elif peg < sector_peg * 1.2:
+            scores.append(0)
         else:
             scores.append(-1)
     else:
@@ -87,46 +168,50 @@ def fundamental_score(info):
     
     # 3. Debt to Equity Ratio
     debt_equity = info.get('debtToEquity', np.nan)
-    if np.isnan(debt_equity):
+    sector_de = sector_medians.get(sector, {}).get('debtToEquity', np.nan)
+    if np.isnan(debt_equity) or np.isnan(sector_de):
         scores.append(0)
-    elif debt_equity < 0.5:
+    elif debt_equity < sector_de * 0.8:
         scores.append(2)
-    elif debt_equity < 1:
+    elif debt_equity < sector_de:
         scores.append(1)
-    elif debt_equity < 2:
+    elif debt_equity < sector_de * 1.2:
         scores.append(0)
     else:
         scores.append(-1)
     
     # 4. Return on Equity (ROE)
     roe = info.get('returnOnEquity', 0)
-    if roe > 0.20:
+    sector_roe = sector_medians.get(sector, {}).get('returnOnEquity', 0)
+    if roe > sector_roe * 1.2:
         scores.append(2)
-    elif roe > 0.10:
+    elif roe > sector_roe:
         scores.append(1)
-    elif roe > 0.05:
+    elif roe > sector_roe * 0.8:
         scores.append(0)
     else:
         scores.append(-1)
     
     # 5. Dividend Yield
     dividend_yield = info.get('dividendYield', 0)
-    if dividend_yield > 0.03:
+    sector_dy = sector_medians.get(sector, {}).get('dividendYield', 0)
+    if dividend_yield > sector_dy * 1.2:
         scores.append(2)
-    elif dividend_yield > 0.01:
+    elif dividend_yield > sector_dy:
         scores.append(1)
-    elif dividend_yield > 0:
+    elif dividend_yield > sector_dy * 0.8:
         scores.append(0)
     else:
         scores.append(-1)
     
     # 6. Revenue Growth
     revenue_growth = info.get('revenueGrowth', 0)
-    if revenue_growth > 0.10:
+    sector_rg = sector_medians.get(sector, {}).get('revenueGrowth', 0)
+    if revenue_growth > sector_rg * 1.2:
         scores.append(2)
-    elif revenue_growth > 0.05:
+    elif revenue_growth > sector_rg:
         scores.append(1)
-    elif revenue_growth > 0:
+    elif revenue_growth > sector_rg * 0.8:
         scores.append(0)
     else:
         scores.append(-1)
@@ -136,57 +221,111 @@ def fundamental_score(info):
     
     # Normalize to 0-10
     normalized = ((total_score + 6) / 18) * 10
-    return max(0, min(10, normalized))  # Clamp to 0-10
+    return max(0, min(10, normalized))
 
-# Strategy: Combined scoring for recommendation
-# Average of fundamental and technical scores
-# >7: Buy (strong fundamentals and technicals)
-# <3: Sell (weak signals)
-# Else: Hold
-# This strategy aims for reliability by requiring alignment between long-term fundamentals and short-term technical momentum,
-# reducing false signals in volatile markets. It's trend-following with value bias, suitable for mid-to-long-term investing.
-# Backtesting on historical data is recommended for accuracy; this is a balanced approach based on standard criteria.
-def get_recommendation(f_score, t_score):
-    avg_score = (f_score + t_score) / 2
-    if avg_score > 7:
+# Compute sector medians
+def compute_sector_medians(tickers):
+    sector_data = {}
+    for ticker in tickers:
+        try:
+            _, info = get_data(ticker)
+            sector = info.get('sector', 'Unknown')
+            if sector not in sector_data:
+                sector_data[sector] = {
+                    'trailingPE': [],
+                    'earningsGrowth': [],
+                    'debtToEquity': [],
+                    'returnOnEquity': [],
+                    'dividendYield': [],
+                    'revenueGrowth': []
+                }
+            sector_data[sector]['trailingPE'].append(info.get('trailingPE', np.nan))
+            sector_data[sector]['earningsGrowth'].append(info.get('earningsGrowth', np.nan))
+            sector_data[sector]['debtToEquity'].append(info.get('debtToEquity', np.nan))
+            sector_data[sector]['returnOnEquity'].append(info.get('returnOnEquity', np.nan))
+            sector_data[sector]['dividendYield'].append(info.get('dividendYield', np.nan))
+            sector_data[sector]['revenueGrowth'].append(info.get('revenueGrowth', np.nan))
+        except:
+            continue
+        time.sleep(0.5)  # Small delay to avoid rate limits during median fetch
+    
+    # Compute medians
+    sector_medians = {}
+    for sector, metrics in sector_data.items():
+        sector_medians[sector] = {
+            'trailingPE': np.nanmedian(metrics['trailingPE']),
+            'earningsGrowth': np.nanmedian(metrics['earningsGrowth']),
+            'debtToEquity': np.nanmedian(metrics['debtToEquity']),
+            'returnOnEquity': np.nanmedian(metrics['returnOnEquity']),
+            'dividendYield': np.nanmedian(metrics['dividendYield']),
+            'revenueGrowth': np.nanmedian(metrics['revenueGrowth'])
+        }
+    return sector_medians
+
+# Strategy: Combined scoring with sector-adjusted fundamentals
+# Weights: Fundamental (50%), Technical (30%), UT Bot (20%)
+def get_recommendation(f_score, t_score, ut_signal):
+    # Convert UT Bot signal to numeric score
+    ut_score = {'Buy': 2, 'Bullish': 1, 'Neutral': 0, 'Bearish': -1, 'Sell': -2}.get(ut_signal, 0)
+    # Normalize UT score to 0-10
+    ut_normalized = (ut_score + 2) * 2.5  # From -2/+2 to 0/10
+    
+    # Weighted average
+    weighted_score = (0.5 * f_score) + (0.3 * t_score) + (0.2 * ut_normalized)
+    
+    if weighted_score > 7:
         return 'Buy'
-    elif avg_score < 3:
+    elif weighted_score < 3:
         return 'Sell'
     else:
         return 'Hold'
 
-# Analyze stocks with progress in Streamlit
+# Analyze stocks with batching and progress in Streamlit
 def analyze_stocks(tickers):
     results = {}
     progress_bar = st.progress(0)
     status_text = st.empty()
     total = len(tickers)
+    processed = 0
+    batch_size = 50  # Batch size to avoid rate limits
     
-    for i, ticker in enumerate(tickers):
-        try:
-            hist, info = get_data(ticker)
-            t_score = technical_score(hist)
-            f_score = fundamental_score(info)
-            rec = get_recommendation(f_score, t_score)
-            current_price = hist['Close'].iloc[-1]
-            sector = info.get('sector', 'Unknown')
+    # Compute sector medians
+    with st.spinner("Computing sector medians..."):
+        sector_medians = compute_sector_medians(tickers)
+    
+    for batch_start in range(0, total, batch_size):
+        batch = tickers[batch_start:batch_start + batch_size]
+        for ticker in batch:
+            try:
+                hist, info = get_data(ticker)
+                t_score = technical_score(hist)
+                f_score = fundamental_score(ticker, info, sector_medians)
+                ut_signal = ut_bot_signal(hist, a=3)
+                rec = get_recommendation(f_score, t_score, ut_signal)
+                current_price = hist['Close'].iloc[-1]
+                sector = info.get('sector', 'Unknown')
+                
+                results[ticker] = {
+                    'Sector': sector,
+                    'Fundamental Score': round(f_score, 2),
+                    'Technical Score': round(t_score, 2),
+                    'UT Bot Signal': ut_signal,
+                    'Recommendation': rec,
+                    'Price': round(current_price, 2),
+                    'TradingView Link': f"https://www.tradingview.com/chart/?symbol={ticker}" if rec in ['Buy', 'Sell'] else ''
+                }
+            except Exception as e:
+                st.warning(f"Error processing {ticker}: {e}")
+                continue
             
-            results[ticker] = {
-                'Sector': sector,
-                'Fundamental Score': round(f_score, 2),
-                'Technical Score': round(t_score, 2),
-                'Recommendation': rec,
-                'Price': round(current_price, 2),
-                'TradingView Link': f"https://www.tradingview.com/chart/?symbol={ticker}" if rec in ['Buy', 'Sell'] else ''
-            }
-        except Exception as e:
-            st.warning(f"Error processing {ticker}: {e}")
-            continue
+            processed += 1
+            progress = processed / total
+            progress_bar.progress(progress)
+            status_text.text(f"Processing {processed}/{total}: {ticker}")
         
-        # Update progress
-        progress = (i + 1) / total
-        progress_bar.progress(progress)
-        status_text.text(f"Processing {i+1}/{total}: {ticker}")
+        if batch_start + batch_size < total:
+            status_text.text("Pausing 30 seconds to avoid rate limits...")
+            time.sleep(30)  # Delay between batches
     
     status_text.text("Analysis complete!")
     return pd.DataFrame.from_dict(results, orient='index')
@@ -269,9 +408,9 @@ def sell_stock(ticker, shares):
         st.error(f"Error selling {ticker}: {e}")
 
 # Main Streamlit App
-st.set_page_config(page_title="Stock Analysis & Paper Trading App", layout="wide")
+st.set_page_config(page_title="Stock Analysis & Paper Trading App (Weekly Data, Sector Comparison)", layout="wide")
 
-st.title("Stock Analysis & Paper Trading App")
+st.title("Stock Analysis & Paper Trading App (Weekly Data, Sector Comparison)")
 
 # Load tickers
 try:
@@ -288,7 +427,7 @@ with tab1:
     st.header("Stock Analysis")
     
     if st.button("Refresh Data"):
-        with st.spinner("Refreshing data... This may take a while for 750 tickers."):
+        with st.spinner("Refreshing data... This may take a while for 750 tickers (batched to avoid rate limits)."):
             df = analyze_stocks(tickers)
             st.session_state.df = df  # Cache in session state
     
@@ -306,6 +445,9 @@ with tab1:
     unique_recs = sorted(df['Recommendation'].unique())
     selected_recs = st.sidebar.multiselect("Recommendations", unique_recs, default=unique_recs)
     
+    unique_ut = sorted(df['UT Bot Signal'].unique())
+    selected_ut = st.sidebar.multiselect("UT Bot Signals", unique_ut, default=unique_ut)
+    
     min_f_score, max_f_score = st.sidebar.slider("Fundamental Score Range", 0.0, 10.0, (0.0, 10.0))
     min_t_score, max_t_score = st.sidebar.slider("Technical Score Range", 0.0, 10.0, (0.0, 10.0))
     min_price, max_price = st.sidebar.slider("Price Range", float(df['Price'].min()), float(df['Price'].max()), (float(df['Price'].min()), float(df['Price'].max())))
@@ -314,14 +456,18 @@ with tab1:
     filtered_df = df[
         (df['Sector'].isin(selected_sectors)) &
         (df['Recommendation'].isin(selected_recs)) &
+        (df['UT Bot Signal'].isin(selected_ut)) &
         (df['Fundamental Score'].between(min_f_score, max_f_score)) &
         (df['Technical Score'].between(min_t_score, max_t_score)) &
         (df['Price'].between(min_price, max_price))
     ]
     
+    # Reorder columns to make UT Bot Signal third
+    columns = ['Sector', 'Fundamental Score', 'UT Bot Signal', 'Technical Score', 'Recommendation', 'Price', 'TradingView Link']
+    filtered_df = filtered_df[columns]
+    
     # Display interactive table
     st.subheader("Filtered Recommendations")
-    # To make links clickable, we can display as markdown, but for dataframe, use styler
     def make_clickable(link):
         if link:
             return f'<a href="{link}" target="_blank">Chart</a>'
@@ -359,5 +505,5 @@ with tab2:
 
 # Footer
 st.markdown("---")
-st.markdown("**Note:** This app uses yfinance for live data. Sectors are fetched from Yahoo Finance. The frontend is interactive with filters, tabs, and real-time paper trading. Run with `streamlit run app.py`.")
-st.markdown("For alternatives like Dash or Flask, let me know for a guide, but Streamlit is simplest for this data app.")
+st.markdown("**Note:** This app uses yfinance for live weekly data. Sectors and fundamentals are fetched from Yahoo Finance. Fundamental scores are sector-adjusted. UT Bot uses sensitivity a=3. Run with `streamlit run app.py`.")
+st.markdown("Analysis may take time due to batching (50 tickers, 30s pause) to avoid rate limits.")
