@@ -8,7 +8,6 @@ import time
 import random
 import plotly.express as px
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # File paths
 TICKERS_FILE = 'tickers.txt'
@@ -38,14 +37,14 @@ def get_data(ticker, retries=3):
             if hist.empty:
                 raise ValueError(f"No historical data for {ticker}")
             info = stock.info
-            time.sleep(random.uniform(0.5, 1.5))  # Reduced delay for concurrent fetching
-            return ticker, hist, info
+            time.sleep(random.uniform(1, 2))
+            return hist, info
         except Exception as e:
             if attempt < retries - 1:
-                time.sleep(10)  # Increased retry delay
+                time.sleep(5)
                 continue
             log_error(f"Failed to fetch data for {ticker}: {e}")
-            return ticker, None, None
+            return None, None
 
 # RSI calculation
 def rsi(series, period=14):
@@ -270,42 +269,41 @@ def get_recommendation(f_score, t_score, ut_signal):
     else:
         return 'Hold'
 
-# Analyze stocks with concurrent fetching and progress
-def analyze_stocks(tickers, status_placeholder):
+# Analyze stocks with progress bar and stock name
+def analyze_stocks(tickers, status_placeholder, progress_bar):
     data_dict = {}
     total = len(tickers)
     failed_tickers = []
     
-    # Concurrent data fetching
-    status_placeholder.text("Fetching data concurrently...")
-    with ThreadPoolExecutor(max_workers=10) as executor:
-        future_to_ticker = {executor.submit(get_data, ticker): ticker for ticker in tickers}
-        processed = 0
-        for future in as_completed(future_to_ticker):
-            ticker = future_to_ticker[future]
-            try:
-                ticker, hist, info = future.result()
-                if hist is not None and info is not None:
-                    data_dict[ticker] = {'hist': hist, 'info': info}
-                else:
-                    failed_tickers.append(ticker)
-            except Exception as e:
-                status_placeholder.warning(f"Error fetching data for {ticker}: {e}")
-                log_error(f"Error fetching data for {ticker}: {e}")
+    # Sequential data fetching
+    status_placeholder.text("Fetching data sequentially...")
+    progress_bar.progress(0.0)
+    
+    for i, ticker in enumerate(tickers):
+        try:
+            hist, info = get_data(ticker)
+            if hist is not None and info is not None:
+                data_dict[ticker] = {'hist': hist, 'info': info}
+            else:
                 failed_tickers.append(ticker)
-            
-            processed += 1
-            progress = processed / total
-            status_placeholder.progress(progress)
-            status_placeholder.text(f"Fetching data {processed}/{total}: {ticker}")
+                status_placeholder.warning(f"Error fetching data for {ticker}")
+        except Exception as e:
+            status_placeholder.warning(f"Error fetching data for {ticker}: {e}")
+            log_error(f"Error fetching data for {ticker}: {e}")
+            failed_tickers.append(ticker)
+        
+        progress = (i + 1) / total
+        progress_bar.progress(progress)
+        status_placeholder.text(f"Fetching data {i + 1}/{total}: {ticker}")
     
     # Check for excessive failures
     if len(failed_tickers) / total > 0.1:  # More than 10% failure
-        status_placeholder.warning("High failure rate detected. Possible rate limit. Check error_log.txt and consider reducing tickers or max_workers.")
+        status_placeholder.warning("High failure rate detected. Possible rate limit. Check error_log.txt and consider reducing tickers.")
     
     results = {}
     if data_dict:
         status_placeholder.text("Computing sector medians...")
+        progress_bar.progress(0.0)
         sector_medians = compute_sector_medians(data_dict)
         
         processed = 0
@@ -336,7 +334,7 @@ def analyze_stocks(tickers, status_placeholder):
             
             processed += 1
             progress = processed / len(data_dict)
-            status_placeholder.progress(progress)
+            progress_bar.progress(progress)
             status_placeholder.text(f"Computing scores {processed}/{len(data_dict)}: {ticker}")
     
     if results:
@@ -459,8 +457,9 @@ tab1, tab2 = st.tabs(["Stock Analysis", "Paper Trading"])
 with tab1:
     st.header("Stock Analysis")
     
-    # Status placeholder for background refresh
+    # Status and progress placeholders
     status_placeholder = st.empty()
+    progress_bar = st.progress(0.0)
     
     # Load cache on start
     cached_df = load_cache()
@@ -472,7 +471,7 @@ with tab1:
     if st.button("Refresh Data", disabled=st.session_state.refreshing):
         st.session_state.refreshing = True
         status_placeholder.info("Background refresh in progress... UI remains responsive.")
-        thread = threading.Thread(target=analyze_stocks, args=(tickers, status_placeholder))
+        thread = threading.Thread(target=analyze_stocks, args=(tickers, status_placeholder, progress_bar))
         thread.start()
     
     # Load data
@@ -564,5 +563,5 @@ with tab2:
 
 # Footer
 st.markdown("---")
-st.markdown("**Note:** Uses yfinance for 3-year weekly data with concurrent fetching (max_workers=10). Fundamentals are sector-adjusted. UT Bot uses a=3. Run with `streamlit run app.py`. Data cached in 'analysis_cache.csv'.")
-st.markdown("**Warning:** Concurrent fetching may hit rate limits. Check error_log.txt for issues. Reduce max_workers, ticker count, or use an alternative API (e.g., Alpha Vantage) if errors occur.")
+st.markdown("**Note:** Uses yfinance for 3-year weekly data with sequential fetching. Fundamentals are sector-adjusted. UT Bot uses a=3. Run with `streamlit run app.py`. Data cached in 'analysis_cache.csv'.")
+st.markdown("**Warning:** Processing 750 tickers may hit rate limits. Check error_log.txt for issues. Reduce ticker count or use an alternative API (e.g., Alpha Vantage) if errors occur.")
