@@ -5,10 +5,12 @@ import numpy as np
 import json
 import os
 import time
+import random  # For random delays
 
 # File paths
-TICKERS_FILE = 'tickers.txt'  # Input file with one ticker per line
-PORTFOLIO_FILE = 'portfolio.json'  # For saving paper trading state (optional, since we use session_state)
+TICKERS_FILE = 'tickers.txt'
+CACHE_FILE = 'analysis_cache.csv'  # New: Cache file for results
+PORTFOLIO_FILE = 'portfolio.json'
 
 # Load tickers
 def load_tickers():
@@ -129,7 +131,7 @@ def ut_bot_signal(hist, a=3, c=10):
 
 # Fundamental scoring: Sector comparison
 # Score each stock relative to its sector's median metrics
-def fundamental_score(ticker, info, sector_medians):
+def fundamental_score(info, sector_medians):
     sector = info.get('sector', 'Unknown')
     scores = []
     
@@ -223,31 +225,27 @@ def fundamental_score(ticker, info, sector_medians):
     normalized = ((total_score + 6) / 18) * 10
     return max(0, min(10, normalized))
 
-# Compute sector medians
-def compute_sector_medians(tickers):
+# Compute sector medians from fetched data
+def compute_sector_medians(data_dict):
     sector_data = {}
-    for ticker in tickers:
-        try:
-            _, info = get_data(ticker)
-            sector = info.get('sector', 'Unknown')
-            if sector not in sector_data:
-                sector_data[sector] = {
-                    'trailingPE': [],
-                    'earningsGrowth': [],
-                    'debtToEquity': [],
-                    'returnOnEquity': [],
-                    'dividendYield': [],
-                    'revenueGrowth': []
-                }
-            sector_data[sector]['trailingPE'].append(info.get('trailingPE', np.nan))
-            sector_data[sector]['earningsGrowth'].append(info.get('earningsGrowth', np.nan))
-            sector_data[sector]['debtToEquity'].append(info.get('debtToEquity', np.nan))
-            sector_data[sector]['returnOnEquity'].append(info.get('returnOnEquity', np.nan))
-            sector_data[sector]['dividendYield'].append(info.get('dividendYield', np.nan))
-            sector_data[sector]['revenueGrowth'].append(info.get('revenueGrowth', np.nan))
-        except:
-            continue
-        time.sleep(0.5)  # Small delay to avoid rate limits during median fetch
+    for ticker, data in data_dict.items():
+        info = data['info']
+        sector = info.get('sector', 'Unknown')
+        if sector not in sector_data:
+            sector_data[sector] = {
+                'trailingPE': [],
+                'earningsGrowth': [],
+                'debtToEquity': [],
+                'returnOnEquity': [],
+                'dividendYield': [],
+                'revenueGrowth': []
+            }
+        sector_data[sector]['trailingPE'].append(info.get('trailingPE', np.nan))
+        sector_data[sector]['earningsGrowth'].append(info.get('earningsGrowth', np.nan))
+        sector_data[sector]['debtToEquity'].append(info.get('debtToEquity', np.nan))
+        sector_data[sector]['returnOnEquity'].append(info.get('returnOnEquity', np.nan))
+        sector_data[sector]['dividendYield'].append(info.get('dividendYield', np.nan))
+        sector_data[sector]['revenueGrowth'].append(info.get('revenueGrowth', np.nan))
     
     # Compute medians
     sector_medians = {}
@@ -280,26 +278,50 @@ def get_recommendation(f_score, t_score, ut_signal):
     else:
         return 'Hold'
 
-# Analyze stocks with batching and progress in Streamlit
+# Analyze stocks with batching, optimized fetching, and progress
 def analyze_stocks(tickers):
+    data_dict = {}  # Store fetched data to avoid duplicate fetches
     results = {}
     progress_bar = st.progress(0)
     status_text = st.empty()
     total = len(tickers)
     processed = 0
-    batch_size = 50  # Batch size to avoid rate limits
-    
-    # Compute sector medians
-    with st.spinner("Computing sector medians..."):
-        sector_medians = compute_sector_medians(tickers)
+    batch_size = 20  # Reduced batch size for more caution
+    pause_time = 60  # Increased pause to 60 seconds
     
     for batch_start in range(0, total, batch_size):
         batch = tickers[batch_start:batch_start + batch_size]
         for ticker in batch:
             try:
                 hist, info = get_data(ticker)
+                data_dict[ticker] = {'hist': hist, 'info': info}
+                time.sleep(random.uniform(1, 3))  # Random delay 1-3s per ticker
+            except Exception as e:
+                st.warning(f"Error fetching data for {ticker}: {e}")
+                continue
+            
+            processed += 1
+            progress = processed / total
+            progress_bar.progress(progress)
+            status_text.text(f"Fetching data {processed}/{total}: {ticker}")
+        
+        if batch_start + batch_size < total:
+            status_text.text(f"Pausing {pause_time} seconds to avoid rate limits...")
+            time.sleep(pause_time)
+    
+    # Now compute medians from fetched data
+    if data_dict:
+        with st.spinner("Computing sector medians..."):
+            sector_medians = compute_sector_medians(data_dict)
+        
+        # Compute scores
+        processed = 0
+        for ticker, data in data_dict.items():
+            try:
+                hist = data['hist']
+                info = data['info']
                 t_score = technical_score(hist)
-                f_score = fundamental_score(ticker, info, sector_medians)
+                f_score = fundamental_score(info, sector_medians)
                 ut_signal = ut_bot_signal(hist, a=3)
                 rec = get_recommendation(f_score, t_score, ut_signal)
                 current_price = hist['Close'].iloc[-1]
@@ -315,22 +337,30 @@ def analyze_stocks(tickers):
                     'TradingView Link': f"https://www.tradingview.com/chart/?symbol={ticker}" if rec in ['Buy', 'Sell'] else ''
                 }
             except Exception as e:
-                st.warning(f"Error processing {ticker}: {e}")
+                st.warning(f"Error computing scores for {ticker}: {e}")
                 continue
             
             processed += 1
-            progress = processed / total
+            progress = processed / len(data_dict)
             progress_bar.progress(progress)
-            status_text.text(f"Processing {processed}/{total}: {ticker}")
-        
-        if batch_start + batch_size < total:
-            status_text.text("Pausing 30 seconds to avoid rate limits...")
-            time.sleep(30)  # Delay between batches
+            status_text.text(f"Computing scores {processed}/{len(data_dict)}: {ticker}")
     
     status_text.text("Analysis complete!")
-    return pd.DataFrame.from_dict(results, orient='index')
+    
+    # Save to cache
+    if results:
+        df = pd.DataFrame.from_dict(results, orient='index')
+        df.to_csv(CACHE_FILE, index_label='Ticker')
+        return df
+    return pd.DataFrame()
 
-# Paper trading functions
+# Load from cache if exists
+def load_cache():
+    if os.path.exists(CACHE_FILE):
+        return pd.read_csv(CACHE_FILE, index_col='Ticker')
+    return None
+
+# Paper trading functions (unchanged)
 def initialize_portfolio():
     if 'portfolio' not in st.session_state:
         st.session_state.portfolio = {
@@ -426,15 +456,25 @@ tab1, tab2 = st.tabs(["Stock Analysis", "Paper Trading"])
 with tab1:
     st.header("Stock Analysis")
     
-    if st.button("Refresh Data"):
-        with st.spinner("Refreshing data... This may take a while for 750 tickers (batched to avoid rate limits)."):
+    # Load cache on start
+    if 'df' not in st.session_state:
+        cached_df = load_cache()
+        if cached_df is not None:
+            st.session_state.df = cached_df
+            st.info("Loaded data from cache. Click 'Refresh Data' for latest.")
+    
+    force_refresh = st.button("Refresh Data (May take time due to rate limits)")
+    
+    if force_refresh:
+        with st.spinner("Refreshing data... This may take a while for 750 tickers (batched with pauses)."):
             df = analyze_stocks(tickers)
-            st.session_state.df = df  # Cache in session state
+            if not df.empty:
+                st.session_state.df = df
     
     if 'df' in st.session_state:
         df = st.session_state.df
     else:
-        st.info("Click 'Refresh Data' to analyze stocks.")
+        st.info("No data available. Click 'Refresh Data' to analyze stocks.")
         st.stop()
     
     # Filters in sidebar
@@ -506,4 +546,5 @@ with tab2:
 # Footer
 st.markdown("---")
 st.markdown("**Note:** This app uses yfinance for live weekly data. Sectors and fundamentals are fetched from Yahoo Finance. Fundamental scores are sector-adjusted. UT Bot uses sensitivity a=3. Run with `streamlit run app.py`.")
-st.markdown("Analysis may take time due to batching (50 tickers, 30s pause) to avoid rate limits.")
+st.markdown("Analysis may take time due to batching (20 tickers, 60s pause) and random delays to avoid rate limits. Data is cached in 'analysis_cache.csv' for faster loads.")
+st.markdown("If rate limits persist, try running on a different IP or wait a few hours.")
