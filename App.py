@@ -5,11 +5,12 @@ import numpy as np
 import json
 import os
 import time
-import random  # For random delays
+import random
+import plotly.express as px
 
 # File paths
 TICKERS_FILE = 'tickers.txt'
-CACHE_FILE = 'analysis_cache.csv'  # New: Cache file for results
+CACHE_FILE = 'analysis_cache.csv'
 PORTFOLIO_FILE = 'portfolio.json'
 
 # Load tickers
@@ -19,14 +20,22 @@ def load_tickers():
     with open(TICKERS_FILE, 'r') as f:
         return [line.strip().upper() for line in f if line.strip()]
 
-# Fetch data with error handling (weekly data)
-def get_data(ticker):
-    stock = yf.Ticker(ticker)
-    hist = stock.history(period='5y', interval='1wk')  # 5 years, weekly data
-    if hist.empty:
-        raise ValueError(f"No historical data for {ticker}")
-    info = stock.info
-    return hist, info
+# Fetch data with retry mechanism (3 years, weekly data)
+def get_data(ticker, retries=3):
+    for attempt in range(retries):
+        try:
+            stock = yf.Ticker(ticker)
+            hist = stock.history(period='3y', interval='1wk')  # Changed to 3 years
+            if hist.empty:
+                raise ValueError(f"No historical data for {ticker}")
+            info = stock.info
+            time.sleep(random.uniform(1, 2))
+            return hist, info
+        except Exception as e:
+            if attempt < retries - 1:
+                time.sleep(5)
+                continue
+            raise e
 
 # RSI calculation
 def rsi(series, period=14):
@@ -36,14 +45,13 @@ def rsi(series, period=14):
     avg_gain = gain.rolling(window=period, min_periods=1).mean()
     avg_loss = loss.rolling(window=period, min_periods=1).mean()
     rs = avg_gain / avg_loss
-    rs = rs.replace([np.inf, -np.inf], np.nan).fillna(0)  # Handle division by zero
+    rs = rs.replace([np.inf, -np.inf], np.nan).fillna(0)
     return 100 - (100 / (1 + rs))
 
 # Technical scoring: SMA200, MACD, RSI, Volume
-# Score normalized to 0-10
 def technical_score(hist):
     if len(hist) < 200:
-        return 5.0  # Neutral if insufficient data
+        return 5.0
     
     close = hist['Close']
     sma200 = close.rolling(window=200).mean().iloc[-1]
@@ -51,7 +59,6 @@ def technical_score(hist):
     
     sma_score = 1 if current_price > sma200 else -1
     
-    # MACD calculation
     exp12 = close.ewm(span=12, adjust=False).mean()
     exp26 = close.ewm(span=26, adjust=False).mean()
     macd_line = exp12 - exp26
@@ -59,34 +66,29 @@ def technical_score(hist):
     
     macd_score = 1 if macd_line.iloc[-1] > signal_line.iloc[-1] else -1
     
-    # RSI score
     rsi_val = rsi(close, 14).iloc[-1]
     rsi_score = 1 if rsi_val > 50 else -1
     
-    # Volume score
     volume = hist['Volume']
     vol_sma50 = volume.rolling(window=50).mean().iloc[-1]
     vol_score = 1 if volume.iloc[-1] > vol_sma50 else -1
     
-    # Combined score: Average of 4 criteria, shifted to 0-10 scale
     raw_score = (sma_score + macd_score + rsi_score + vol_score) / 4
-    normalized_score = (raw_score + 1) * 5  # From 0 to 10
+    normalized_score = (raw_score + 1) * 5
     return normalized_score
 
-# UT Bot Alert Signal (translated from PineScript, sensitivity a=3, on weekly data)
+# UT Bot Alert Signal (sensitivity a=3, weekly data)
 def ut_bot_signal(hist, a=3, c=10):
     close = hist['Close']
     high = hist['High']
     low = hist['Low']
     
-    # Compute True Range and ATR
     prev_close = close.shift(1)
     tr = pd.concat([high - low, abs(high - prev_close), abs(low - prev_close)], axis=1).max(axis=1)
     atr = tr.rolling(window=c).mean()
     
     nloss = a * atr
     
-    # Trailing Stop (xATRTrailingStop)
     ts = pd.Series(np.nan, index=close.index)
     for i in range(1, len(close)):
         if pd.isna(ts[i-1]):
@@ -100,7 +102,6 @@ def ut_bot_signal(hist, a=3, c=10):
         else:
             ts[i] = close[i] + nloss[i]
     
-    # Position (pos)
     pos = pd.Series(0, index=close.index)
     for i in range(1, len(close)):
         if close[i-1] < ts[i-1] and close[i] > ts[i-1]:
@@ -110,14 +111,12 @@ def ut_bot_signal(hist, a=3, c=10):
         else:
             pos[i] = pos[i-1]
     
-    # Crossovers for buy/sell
     above = (close > ts.shift(1)) & (close.shift(1) <= ts.shift(1))
     below = (close < ts.shift(1)) & (close.shift(1) >= ts.shift(1))
     
     buy = (close > ts) & above
     sell = (close < ts) & below
     
-    # Latest signal
     if buy.iloc[-1]:
         return 'Buy'
     elif sell.iloc[-1]:
@@ -130,17 +129,15 @@ def ut_bot_signal(hist, a=3, c=10):
         return 'Neutral'
 
 # Fundamental scoring: Sector comparison
-# Score each stock relative to its sector's median metrics
 def fundamental_score(info, sector_medians):
     sector = info.get('sector', 'Unknown')
     scores = []
     
-    # 1. P/E Ratio
     pe = info.get('trailingPE', np.nan)
     sector_pe = sector_medians.get(sector, {}).get('trailingPE', np.nan)
     if np.isnan(pe) or np.isnan(sector_pe):
         scores.append(0)
-    elif pe < sector_pe * 0.8:  # Better than sector
+    elif pe < sector_pe * 0.8:
         scores.append(2)
     elif pe < sector_pe:
         scores.append(1)
@@ -149,7 +146,6 @@ def fundamental_score(info, sector_medians):
     else:
         scores.append(-1)
     
-    # 2. PEG Ratio
     earnings_growth = info.get('earningsGrowth', 0) * 100
     sector_eg = sector_medians.get(sector, {}).get('earningsGrowth', 0) * 100
     if earnings_growth > 0 and not np.isnan(pe):
@@ -168,7 +164,6 @@ def fundamental_score(info, sector_medians):
     else:
         scores.append(0 if earnings_growth > 0 else -1)
     
-    # 3. Debt to Equity Ratio
     debt_equity = info.get('debtToEquity', np.nan)
     sector_de = sector_medians.get(sector, {}).get('debtToEquity', np.nan)
     if np.isnan(debt_equity) or np.isnan(sector_de):
@@ -182,7 +177,6 @@ def fundamental_score(info, sector_medians):
     else:
         scores.append(-1)
     
-    # 4. Return on Equity (ROE)
     roe = info.get('returnOnEquity', 0)
     sector_roe = sector_medians.get(sector, {}).get('returnOnEquity', 0)
     if roe > sector_roe * 1.2:
@@ -194,7 +188,6 @@ def fundamental_score(info, sector_medians):
     else:
         scores.append(-1)
     
-    # 5. Dividend Yield
     dividend_yield = info.get('dividendYield', 0)
     sector_dy = sector_medians.get(sector, {}).get('dividendYield', 0)
     if dividend_yield > sector_dy * 1.2:
@@ -206,7 +199,6 @@ def fundamental_score(info, sector_medians):
     else:
         scores.append(-1)
     
-    # 6. Revenue Growth
     revenue_growth = info.get('revenueGrowth', 0)
     sector_rg = sector_medians.get(sector, {}).get('revenueGrowth', 0)
     if revenue_growth > sector_rg * 1.2:
@@ -218,14 +210,11 @@ def fundamental_score(info, sector_medians):
     else:
         scores.append(-1)
     
-    # Total raw score (max 12, min -6)
     total_score = sum(scores)
-    
-    # Normalize to 0-10
     normalized = ((total_score + 6) / 18) * 10
     return max(0, min(10, normalized))
 
-# Compute sector medians from fetched data
+# Compute sector medians
 def compute_sector_medians(data_dict):
     sector_data = {}
     for ticker, data in data_dict.items():
@@ -247,7 +236,6 @@ def compute_sector_medians(data_dict):
         sector_data[sector]['dividendYield'].append(info.get('dividendYield', np.nan))
         sector_data[sector]['revenueGrowth'].append(info.get('revenueGrowth', np.nan))
     
-    # Compute medians
     sector_medians = {}
     for sector, metrics in sector_data.items():
         sector_medians[sector] = {
@@ -260,17 +248,11 @@ def compute_sector_medians(data_dict):
         }
     return sector_medians
 
-# Strategy: Combined scoring with sector-adjusted fundamentals
-# Weights: Fundamental (50%), Technical (30%), UT Bot (20%)
+# Strategy: Weighted scoring
 def get_recommendation(f_score, t_score, ut_signal):
-    # Convert UT Bot signal to numeric score
     ut_score = {'Buy': 2, 'Bullish': 1, 'Neutral': 0, 'Bearish': -1, 'Sell': -2}.get(ut_signal, 0)
-    # Normalize UT score to 0-10
-    ut_normalized = (ut_score + 2) * 2.5  # From -2/+2 to 0/10
-    
-    # Weighted average
+    ut_normalized = (ut_score + 2) * 2.5
     weighted_score = (0.5 * f_score) + (0.3 * t_score) + (0.2 * ut_normalized)
-    
     if weighted_score > 7:
         return 'Buy'
     elif weighted_score < 3:
@@ -278,43 +260,30 @@ def get_recommendation(f_score, t_score, ut_signal):
     else:
         return 'Hold'
 
-# Analyze stocks with batching, optimized fetching, and progress
+# Analyze stocks with progress
 def analyze_stocks(tickers):
-    data_dict = {}  # Store fetched data to avoid duplicate fetches
+    data_dict = {}
     results = {}
     progress_bar = st.progress(0)
     status_text = st.empty()
     total = len(tickers)
-    processed = 0
-    batch_size = 20  # Reduced batch size for more caution
-    pause_time = 60  # Increased pause to 60 seconds
     
-    for batch_start in range(0, total, batch_size):
-        batch = tickers[batch_start:batch_start + batch_size]
-        for ticker in batch:
-            try:
-                hist, info = get_data(ticker)
-                data_dict[ticker] = {'hist': hist, 'info': info}
-                time.sleep(random.uniform(1, 3))  # Random delay 1-3s per ticker
-            except Exception as e:
-                st.warning(f"Error fetching data for {ticker}: {e}")
-                continue
-            
-            processed += 1
-            progress = processed / total
-            progress_bar.progress(progress)
-            status_text.text(f"Fetching data {processed}/{total}: {ticker}")
+    for i, ticker in enumerate(tickers):
+        try:
+            hist, info = get_data(ticker)
+            data_dict[ticker] = {'hist': hist, 'info': info}
+        except Exception as e:
+            st.warning(f"Error fetching data for {ticker}: {e}")
+            continue
         
-        if batch_start + batch_size < total:
-            status_text.text(f"Pausing {pause_time} seconds to avoid rate limits...")
-            time.sleep(pause_time)
+        progress = (i + 1) / total
+        progress_bar.progress(progress)
+        status_text.text(f"Fetching data {i + 1}/{total}: {ticker}")
     
-    # Now compute medians from fetched data
     if data_dict:
         with st.spinner("Computing sector medians..."):
             sector_medians = compute_sector_medians(data_dict)
         
-        # Compute scores
         processed = 0
         for ticker, data in data_dict.items():
             try:
@@ -347,20 +316,20 @@ def analyze_stocks(tickers):
     
     status_text.text("Analysis complete!")
     
-    # Save to cache
     if results:
         df = pd.DataFrame.from_dict(results, orient='index')
+        df['Last Updated'] = pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')
         df.to_csv(CACHE_FILE, index_label='Ticker')
         return df
     return pd.DataFrame()
 
-# Load from cache if exists
+# Load from cache
 def load_cache():
     if os.path.exists(CACHE_FILE):
         return pd.read_csv(CACHE_FILE, index_col='Ticker')
     return None
 
-# Paper trading functions (unchanged)
+# Paper trading functions
 def initialize_portfolio():
     if 'portfolio' not in st.session_state:
         st.session_state.portfolio = {
@@ -383,7 +352,7 @@ def view_portfolio():
             df_holdings.append({
                 'Ticker': ticker,
                 'Shares': data['shares'],
-                'Avg Buy Price': round(data['avg_buy_price'], 2),
+                'Avg Buy Price': round(data['avg_buy_price', 2),
                 'Current Price': round(current_price, 2),
                 'Value': round(value, 2),
                 'P&L': round(pnl, 2)
@@ -438,9 +407,9 @@ def sell_stock(ticker, shares):
         st.error(f"Error selling {ticker}: {e}")
 
 # Main Streamlit App
-st.set_page_config(page_title="Stock Analysis & Paper Trading App (Weekly Data, Sector Comparison)", layout="wide")
+st.set_page_config(page_title="Stock Analysis & Paper Trading App", layout="wide")
 
-st.title("Stock Analysis & Paper Trading App (Weekly Data, Sector Comparison)")
+st.title("Stock Analysis & Paper Trading App (3-Year Weekly Data, Sector Comparison)")
 
 # Load tickers
 try:
@@ -456,23 +425,21 @@ tab1, tab2 = st.tabs(["Stock Analysis", "Paper Trading"])
 with tab1:
     st.header("Stock Analysis")
     
-    # Load cache on start
-    if 'df' not in st.session_state:
-        cached_df = load_cache()
-        if cached_df is not None:
-            st.session_state.df = cached_df
-            st.info("Loaded data from cache. Click 'Refresh Data' for latest.")
+    cached_df = load_cache()
+    if cached_df is not None:
+        last_updated = cached_df['Last Updated'].iloc[0] if 'Last Updated' in cached_df.columns else "Unknown"
+        st.info(f"Showing cached data (last updated: {last_updated}). Click 'Refresh Data' for latest.")
     
-    force_refresh = st.button("Refresh Data (May take time due to rate limits)")
-    
-    if force_refresh:
-        with st.spinner("Refreshing data... This may take a while for 750 tickers (batched with pauses)."):
+    if st.button("Refresh Data"):
+        with st.spinner("Refreshing data... This may take a while for 750 tickers."):
             df = analyze_stocks(tickers)
             if not df.empty:
                 st.session_state.df = df
     
     if 'df' in st.session_state:
         df = st.session_state.df
+    elif cached_df is not None:
+        df = cached_df
     else:
         st.info("No data available. Click 'Refresh Data' to analyze stocks.")
         st.stop()
@@ -502,11 +469,11 @@ with tab1:
         (df['Price'].between(min_price, max_price))
     ]
     
-    # Reorder columns to make UT Bot Signal third
+    # Reorder columns
     columns = ['Sector', 'Fundamental Score', 'UT Bot Signal', 'Technical Score', 'Recommendation', 'Price', 'TradingView Link']
     filtered_df = filtered_df[columns]
     
-    # Display interactive table
+    # Display table
     st.subheader("Filtered Recommendations")
     def make_clickable(link):
         if link:
@@ -515,6 +482,12 @@ with tab1:
     
     styled_df = filtered_df.style.format({'TradingView Link': make_clickable})
     st.write(styled_df, unsafe_allow_html=True)
+    
+    # Visualization
+    st.subheader("Recommendation Distribution by Sector")
+    rec_counts = filtered_df.groupby(['Sector', 'Recommendation']).size().unstack(fill_value=0)
+    fig = px.bar(rec_counts, barmode='stack', title="Recommendations by Sector")
+    st.plotly_chart(fig)
     
     # Download option
     csv = filtered_df.to_csv()
@@ -545,6 +518,5 @@ with tab2:
 
 # Footer
 st.markdown("---")
-st.markdown("**Note:** This app uses yfinance for live weekly data. Sectors and fundamentals are fetched from Yahoo Finance. Fundamental scores are sector-adjusted. UT Bot uses sensitivity a=3. Run with `streamlit run app.py`.")
-st.markdown("Analysis may take time due to batching (20 tickers, 60s pause) and random delays to avoid rate limits. Data is cached in 'analysis_cache.csv' for faster loads.")
-st.markdown("If rate limits persist, try running on a different IP or wait a few hours.")
+st.markdown("**Note:** Uses yfinance for 3-year weekly data. Fundamentals are sector-adjusted. UT Bot uses a=3. Run with `streamlit run app.py`. Data cached in 'analysis_cache.csv'.")
+st.markdown("**Warning:** Processing 750 tickers may hit rate limits. If errors occur, try a smaller ticker list, wait a few hours, or use an alternative API (e.g., Alpha Vantage).")
