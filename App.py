@@ -130,7 +130,7 @@ def macd_signal(hist):
     else:
         return 'Neutral'
 
-# UT Bot Alert Signal (sensitivity a=3, weekly data) - Adjusted to match TradingView
+# UT Bot Alert Signal (sensitivity a=3, weekly data)
 def ut_bot_signal(hist, a=3, c=10):
     close = hist['Close']
     high = hist['High']
@@ -376,21 +376,31 @@ def analyze_stocks(tickers, status_placeholder, progress_bar):
                 sma200 = hist['Close'].rolling(window=200).mean().iloc[-1]
                 vol_ratio = hist['Volume'].iloc[-1] / hist['Volume'].rolling(window=50).mean().iloc[-1]
                 
-                fundamental_data = f"P/E: {round(pe, 2)}, PEG: {round(peg, 2)}, Debt/Equity: {round(debt_equity, 2)}, ROE: {round(roe, 2)}, Dividend Yield: {round(dividend_yield, 2)}, Revenue Growth: {round(revenue_growth, 2)}"
+                fundamental_data = f"P/E: {round(pe, 2) if not np.isnan(pe) else 'N/A'}, PEG: {round(peg, 2) if not np.isnan(peg) else 'N/A'}, Debt/Equity: {round(debt_equity, 2) if not np.isnan(debt_equity) else 'N/A'}, ROE: {round(roe, 2) if not np.isnan(roe) else 'N/A'}, Dividend Yield: {round(dividend_yield, 2) if not np.isnan(dividend_yield) else 'N/A'}, Revenue Growth: {round(revenue_growth, 2) if not np.isnan(revenue_growth) else 'N/A'}"
                 technical_data = f"RSI: {round(rsi_val, 0)}, MACD: {round(macd_val, 2)}, SMA200: {round(sma200, 2)}, Volume vs SMA50: {round(vol_ratio, 0)}"
                 
                 results[ticker] = {
                     'Sector': sector,
                     'Fundamental Score': round(f_score, 2),
                     'Fundamental Data': fundamental_data,
+                    'P/E Ratio': round(pe, 2) if not np.isnan(pe) else np.nan,
+                    'PEG Ratio': round(peg, 2) if not np.isnan(peg) else np.nan,
+                    'Debt/Equity': round(debt_equity, 2) if not np.isnan(debt_equity) else np.nan,
+                    'ROE': round(roe, 2) if not np.isnan(roe) else np.nan,
+                    'Dividend Yield': round(dividend_yield, 2) if not np.isnan(dividend_yield) else np.nan,
+                    'Revenue Growth': round(revenue_growth, 2) if not np.isnan(revenue_growth) else np.nan,
                     'Technical Score': round(t_score, 2),
                     'Technical Data': technical_data,
+                    'RSI': round(rsi_val, 0),
+                    'MACD': round(macd_val, 2),
+                    'SMA200': round(sma200, 2),
+                    'Volume vs SMA50': round(vol_ratio, 0),
                     'UT Bot Signal': ut_signal,
                     'EMA 200 Signal': ema_signal,
                     'MACD Signal': macd_sig,
                     'Recommendation': rec,
                     'Price': round(current_price, 2),
-                    'TradingView Link': f"https://www.tradingview.com/chart/?symbol={ticker}" if rec in ['Buy', 'Sell'] else ''
+                    'TradingView Link': f"https://www.tradingview.com/chart/?symbol={ticker}"
                 }
             except Exception as e:
                 status_placeholder.warning(f"Error computing scores for {ticker}: {e}")
@@ -411,16 +421,155 @@ def analyze_stocks(tickers, status_placeholder, progress_bar):
         status_placeholder.error("No data processed. Check error_log.txt for details.")
         return None
 
-# Load from cache
+# Load from cache with column validation
 def load_cache():
     if os.path.exists(CACHE_FILE):
-        return pd.read_csv(CACHE_FILE, index_col='Ticker')
+        try:
+            df = pd.read_csv(CACHE_FILE, index_col='Ticker')
+            expected_columns = [
+                'Sector', 'Fundamental Score', 'Fundamental Data', 'P/E Ratio', 'PEG Ratio', 'Debt/Equity', 'ROE',
+                'Dividend Yield', 'Revenue Growth', 'Technical Score', 'Technical Data', 'RSI', 'MACD', 'SMA200',
+                'Volume vs SMA50', 'UT Bot Signal', 'EMA 200 Signal', 'MACD Signal', 'Recommendation', 'Price',
+                'TradingView Link', 'Last Updated'
+            ]
+            for col in expected_columns:
+                if col not in df.columns:
+                    df[col] = np.nan if col in ['Fundamental Score', 'P/E Ratio', 'PEG Ratio', 'Debt/Equity', 'ROE', 'Dividend Yield', 'Revenue Growth', 'Technical Score', 'RSI', 'MACD', 'SMA200', 'Volume vs SMA50', 'Price'] else ''
+                    log_error(f"Added missing column {col} to cache")
+            return df
+        except Exception as e:
+            log_error(f"Error loading cache: {e}")
+            return None
     return None
+
+# Paper trading functions
+def initialize_portfolio():
+    if 'portfolio' not in st.session_state:
+        st.session_state.portfolio = {
+            'cash': 100000.0,
+            'holdings': {}
+        }
+
+def view_portfolio():
+    portfolio = st.session_state.portfolio
+    cash = portfolio['cash']
+    holdings = portfolio['holdings']
+    total_value = cash
+    df_holdings = []
+    
+    for ticker, data in holdings.items():
+        try:
+            current_price = yf.Ticker(ticker).history(period='1d')['Close'].iloc[-1]
+            value = data['shares'] * current_price
+            pnl = value - (data['shares'] * data['avg_buy_price'])
+            df_holdings.append({
+                'Ticker': ticker,
+                'Shares': data['shares'],
+                'Avg Buy Price': round(data['avg_buy_price'], 2),
+                'Current Price': round(current_price, 2),
+                'Value': round(value, 2),
+                'P&L': round(pnl, 2)
+            })
+            total_value += value
+        except Exception as e:
+            st.warning(f"Error fetching price for {ticker}: {e}")
+            log_error(f"Error fetching portfolio price for {ticker}: {e}")
+    
+    if df_holdings:
+        df_portfolio = pd.DataFrame(df_holdings)
+        st.subheader("Portfolio Holdings")
+        for i, row in df_portfolio.iterrows():
+            cols = st.columns([2, 1, 1, 1, 1, 1, 1])
+            cols[0].write(row['Ticker'])
+            cols[1].write(row['Shares'])
+            cols[2].write(f"{CURRENCY_SYMBOL}{row['Avg Buy Price']:.2f}")
+            cols[3].write(f"{CURRENCY_SYMBOL}{row['Current Price']:.2f}")
+            cols[4].write(f"{CURRENCY_SYMBOL}{row['Value']:.2f}")
+            cols[5].write(f"{CURRENCY_SYMBOL}{row['P&L']:.2f}")
+            if cols[6].button("Sell", key=f"sell_{row['Ticker']}_{i}"):
+                sell_shares = st.number_input(f"Shares to Sell ({row['Ticker']})", min_value=1.0, max_value=row['Shares'], step=1.0, key=f"sell_shares_{row['Ticker']}_{i}")
+                if st.button(f"Confirm Sell {row['Ticker']}", key=f"confirm_sell_{row['Ticker']}_{i}"):
+                    sell_stock(row['Ticker'], sell_shares)
+                    st.experimental_rerun()
+    
+    st.metric("Cash", f"{CURRENCY_SYMBOL}{cash:.2f}")
+    st.metric("Total Portfolio Value", f"{CURRENCY_SYMBOL}{total_value:.2f}")
+
+def buy_stock(ticker, shares):
+    portfolio = st.session_state.portfolio
+    try:
+        price = yf.Ticker(ticker).history(period='1d')['Close'].iloc[-1]
+        cost = shares * price
+        if cost > portfolio['cash']:
+            st.error("Insufficient cash")
+            return
+        portfolio['cash'] -= cost
+        if ticker in portfolio['holdings']:
+            old_shares = portfolio['holdings'][ticker]['shares']
+            old_cost = old_shares * portfolio['holdings'][ticker]['avg_buy_price']
+            new_shares = old_shares + shares
+            new_avg = (old_cost + cost) / new_shares
+            portfolio['holdings'][ticker] = {'shares': new_shares, 'avg_buy_price': new_avg}
+        else:
+            portfolio['holdings'][ticker] = {'shares': shares, 'avg_buy_price': price}
+        st.success(f"Bought {shares} shares of {ticker} @ {CURRENCY_SYMBOL}{price:.2f}")
+    except Exception as e:
+        st.error(f"Error buying {ticker}: {e}")
+        log_error(f"Error buying {ticker}: {e}")
+
+def sell_stock(ticker, shares):
+    portfolio = st.session_state.portfolio
+    if ticker not in portfolio['holdings'] or shares > portfolio['holdings'][ticker]['shares']:
+        st.error("Insufficient shares or not held")
+        return
+    try:
+        price = yf.Ticker(ticker).history(period='1d')['Close'].iloc[-1]
+        revenue = shares * price
+        portfolio['cash'] += revenue
+        portfolio['holdings'][ticker]['shares'] -= shares
+        if portfolio['holdings'][ticker]['shares'] <= 0:
+            del portfolio['holdings'][ticker]
+        st.success(f"Sold {shares} shares of {ticker} @ {CURRENCY_SYMBOL}{price:.2f}")
+    except Exception as e:
+        st.error(f"Error selling {ticker}: {e}")
+        log_error(f"Error selling {ticker}: {e}")
 
 # Main Streamlit App
 st.set_page_config(page_title="Stock Analysis & Paper Trading App", layout="wide")
 
-st.title("Stock Analysis & Paper Trading App (5-Year Weekly Data, Sector Comparison)")
+# Custom CSS for improved styling
+st.markdown("""
+    <style>
+    .stApp {
+        background-color: #f0f2f6;
+    }
+    .stButton>button {
+        background-color: #4CAF50;
+        color: white;
+        border-radius: 5px;
+    }
+    .stTextInput>div>input {
+        border-radius: 5px;
+    }
+    .stMetric {
+        background-color: #ffffff;
+        border-radius: 5px;
+        padding: 10px;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    }
+    .sidebar .sidebar-content {
+        background-color: #ffffff;
+        border-radius: 5px;
+        padding: 10px;
+    }
+    </style>
+""", unsafe_allow_html=True)
+
+st.title("📈 Stock Analysis & Paper Trading App")
+st.markdown("Analyze stocks with 5-year weekly data and sector-adjusted fundamentals. Trade virtually with ₹100,000 starting capital.")
+
+# Initialize portfolio
+initialize_portfolio()
 
 # Load tickers
 try:
@@ -431,8 +580,9 @@ except Exception as e:
     st.stop()
 
 # Status and progress placeholders
-status_placeholder = st.empty()
-progress_bar = st.progress(0.0)
+with st.container():
+    status_placeholder = st.empty()
+    progress_bar = st.progress(0.0)
 
 # Load cache on start
 cached_df = load_cache()
@@ -441,7 +591,7 @@ if cached_df is not None:
     st.info(f"Showing cached data (last updated: {last_updated}). Click 'Refresh Data' to update.")
 
 # Refresh button
-if st.button("Refresh Data"):
+if st.button("🔄 Refresh Data"):
     status_placeholder.info("Processing data... UI will be unresponsive until complete.")
     df = analyze_stocks(tickers, status_placeholder, progress_bar)
     if df is not None:
@@ -460,105 +610,216 @@ else:
 
 # Cache expiration check
 if 'Last Updated' in df.columns:
-    cache_age = (pd.Timestamp.now() - pd.to_datetime(df['Last Updated'].iloc[0])).total_seconds() / 3600
-    if cache_age > 24:
-        st.warning("Cached data is over 24 hours old. Please refresh.")
+    try:
+        cache_age = (pd.Timestamp.now() - pd.to_datetime(df['Last Updated'].iloc[0])).total_seconds() / 3600
+        if cache_age > 24:
+            st.warning("Cached data is over 24 hours old. Please refresh.")
+    except Exception as e:
+        log_error(f"Error checking cache age: {e}")
+        st.warning("Invalid cache timestamp. Please refresh data.")
 
 # Filters in sidebar
-st.sidebar.header("Filters")
-unique_sectors = sorted(df['Sector'].unique())
-selected_sectors = st.sidebar.multiselect("Sectors", unique_sectors, default=unique_sectors)
+st.sidebar.header("🔍 Filters")
+with st.sidebar.expander("Sector Filters", expanded=True):
+    unique_sectors = sorted(df['Sector'].unique())
+    selected_sectors = st.multiselect("Select Sectors", unique_sectors, default=unique_sectors, key="sector_filter")
 
-unique_recs = sorted(df['Recommendation'].unique())
-selected_recs = st.sidebar.multiselect("Recommendations", unique_recs, default=['Buy', 'Bullish'])
+with st.sidebar.expander("Signal Filters", expanded=True):
+    unique_recs = sorted(df['Recommendation'].unique())
+    default_recs = [rec for rec in ['Buy', 'Bullish'] if rec in unique_recs] or unique_recs
+    selected_recs = st.multiselect("Recommendations", unique_recs, default=default_recs, key="rec_filter")
+    
+    unique_ut = sorted(df['UT Bot Signal'].unique()) if 'UT Bot Signal' in df.columns else []
+    selected_ut = st.multiselect("UT Bot Signals", unique_ut, default=unique_ut, key="ut_filter")
+    
+    unique_ema = sorted(df['EMA 200 Signal'].unique()) if 'EMA 200 Signal' in df.columns else []
+    selected_ema = st.multiselect("EMA 200 Signals", unique_ema, default=unique_ema, key="ema_filter")
+    
+    unique_macd = sorted(df['MACD Signal'].unique()) if 'MACD Signal' in df.columns else []
+    selected_macd = st.multiselect("MACD Signals", unique_macd, default=unique_macd, key="macd_filter")
 
-unique_ut = sorted(df['UT Bot Signal'].unique())
-selected_ut = st.sidebar.multiselect("UT Bot Signals", unique_ut, default=unique_ut)
-
-unique_ema = sorted(df['EMA 200 Signal'].unique())
-selected_ema = st.sidebar.multiselect("EMA 200 Signals", unique_ema, default=unique_ema)
-
-unique_macd = sorted(df['MACD Signal'].unique())
-selected_macd = st.sidebar.multiselect("MACD Signals", unique_macd, default=unique_macd)
-
-min_f_score, max_f_score = st.sidebar.slider("Fundamental Score Range", 0.0, 10.0, (0.0, 10.0))
-min_t_score, max_t_score = st.sidebar.slider("Technical Score Range", 0.0, 10.0, (0.0, 10.0))
-min_price, max_price = st.sidebar.slider("Price Range", float(df['Price'].min()), float(df['Price'].max()), (float(df['Price'].min()), float(df['Price'].max())))
+with st.sidebar.expander("Metric Filters", expanded=True):
+    min_f_score, max_f_score = st.slider("Fundamental Score Range", 0.0, 10.0, (0.0, 10.0), key="f_score_filter")
+    min_t_score, max_t_score = st.slider("Technical Score Range", 0.0, 10.0, (0.0, 10.0), key="t_score_filter")
+    min_price, max_price = st.slider("Price Range (₹)", float(df['Price'].min()), float(df['Price'].max()), (float(df['Price'].min()), float(df['Price'].max())), key="price_filter")
+    min_pe, max_pe = st.slider("P/E Ratio Range", float(df['P/E Ratio'].min()), float(df['P/E Ratio'].max()), (float(df['P/E Ratio'].min()), float(df['P/E Ratio'].max())), key="pe_filter") if 'P/E Ratio' in df.columns else (0.0, 100.0)
+    min_rsi, max_rsi = st.slider("RSI Range", 0.0, 100.0, (0.0, 100.0), key="rsi_filter") if 'RSI' in df.columns else (0.0, 100.0)
 
 # Apply filters
 filtered_df = df[
     (df['Sector'].isin(selected_sectors)) &
     (df['Recommendation'].isin(selected_recs)) &
-    (df['UT Bot Signal'].isin(selected_ut)) &
-    (df['EMA 200 Signal'].isin(selected_ema)) &
-    (df['MACD Signal'].isin(selected_macd)) &
+    (df['UT Bot Signal'].isin(selected_ut) if 'UT Bot Signal' in df.columns else True) &
+    (df['EMA 200 Signal'].isin(selected_ema) if 'EMA 200 Signal' in df.columns else True) &
+    (df['MACD Signal'].isin(selected_macd) if 'MACD Signal' in df.columns else True) &
     (df['Fundamental Score'].between(min_f_score, max_f_score)) &
     (df['Technical Score'].between(min_t_score, max_t_score)) &
-    (df['Price'].between(min_price, max_price))
+    (df['Price'].between(min_price, max_price)) &
+    (df['P/E Ratio'].between(min_pe, max_pe) if 'P/E Ratio' in df.columns else True) &
+    (df['RSI'].between(min_rsi, max_rsi) if 'RSI' in df.columns else True)
 ]
 
-# Reorder columns
-columns = ['Sector', 'Fundamental Score', 'UT Bot Signal', 'EMA 200 Signal', 'MACD Signal', 'Technical Score', 'Recommendation', 'Price', 'TradingView Link']
-filtered_df = filtered_df[columns]
+# Reorder columns for display
+display_columns = [
+    'Sector', 'Fundamental Score', 'Fundamental Data', 'Technical Score', 'Technical Data',
+    'UT Bot Signal', 'EMA 200 Signal', 'MACD Signal', 'Recommendation', 'Price', 'TradingView Link'
+]
+available_columns = [col for col in display_columns if col in filtered_df.columns]
+if len(available_columns) < len(display_columns):
+    missing = [col for col in display_columns if col not in filtered_df.columns]
+    log_error(f"Missing columns in DataFrame: {missing}")
+    st.warning(f"Some columns are missing: {missing}. Click 'Refresh Data' to regenerate.")
+
+filtered_df_display = filtered_df[available_columns]
 
 # Display table
 st.subheader("Filtered Recommendations")
 def make_clickable(link):
     if link:
-        return f'<a href="{link}" target="_blank">Chart</a>'
+        return f'<a href="{link}" target="_blank">📊 Chart</a>'
     return ''
 
-styled_df = filtered_df.style.format({'TradingView Link': make_clickable})
+styled_df = filtered_df_display.style.format({
+    'Fundamental Score': '{:.2f}',
+    'Technical Score': '{:.2f}',
+    'Price': f'{CURRENCY_SYMBOL}{{:.2f}}',
+    'TradingView Link': make_clickable
+})
 st.write(styled_df, unsafe_allow_html=True)
 
 # Ticker details and paper trading
 st.subheader("Select Ticker for Details and Trading")
-selected_ticker = st.selectbox("Select Ticker", filtered_df.index)
+selected_ticker = st.selectbox("Select Ticker", options=[''] + list(filtered_df.index), index=0)
 
 if selected_ticker:
-    with st.expander(f"Details for {selected_ticker}"):
+    with st.expander(f"Details for {selected_ticker}", expanded=True):
         row = filtered_df.loc[selected_ticker]
-        st.write(row)
+        st.write("**Fundamental Metrics**")
+        st.write(f"- Fundamental Score: {row['Fundamental Score']:.2f}")
+        st.write(f"- {row['Fundamental Data']}")
+        st.write("**Technical Metrics**")
+        st.write(f"- Technical Score: {row['Technical Score']:.2f}")
+        st.write(f"- {row['Technical Data']}")
+        st.write(f"- UT Bot Signal: {row['UT Bot Signal']}")
+        st.write(f"- EMA 200 Signal: {row['EMA 200 Signal']}")
+        st.write(f"- MACD Signal: {row['MACD Signal']}")
+        st.write(f"- Recommendation: {row['Recommendation']}")
+        st.write(f"- Price: {CURRENCY_SYMBOL}{row['Price']:.2f}")
+        if row['TradingView Link']:
+            st.markdown(f"[View on TradingView]({row['TradingView Link']})")
         
         # Price chart
-        hist = yf.Ticker(selected_ticker).history(period='1y')
-        fig = go.Figure(data=[go.Candlestick(x=hist.index,
-                                             open=hist['Open'],
-                                             high=hist['High'],
-                                             low=hist['Low'],
-                                             close=hist['Close'])])
-        fig.update_layout(title=f"{selected_ticker} Price Chart", xaxis_title="Date", yaxis_title="Price", xaxis_rangeslider_visible=True)
-        st.plotly_chart(fig)
+        try:
+            hist = yf.Ticker(selected_ticker).history(period='1y')
+            fig = go.Figure(data=[go.Candlestick(
+                x=hist.index,
+                open=hist['Open'],
+                high=hist['High'],
+                low=hist['Low'],
+                close=hist['Close']
+            )])
+            fig.update_layout(
+                title=f"{selected_ticker} 1-Year Price Chart",
+                xaxis_title="Date",
+                yaxis_title=f"Price ({CURRENCY_SYMBOL})",
+                xaxis_rangeslider_visible=True,
+                template='plotly_white',
+                height=400
+            )
+            st.plotly_chart(fig, use_container_width=True)
+        except Exception as e:
+            st.warning(f"Error fetching chart for {selected_ticker}: {e}")
+            log_error(f"Error fetching chart for {selected_ticker}: {e}")
         
         # Buy/Sell forms
-        buy_shares = st.number_input("Shares to Buy", min_value=1.0, step=1.0)
-        if st.button("Buy"):
-            buy_stock(selected_ticker, buy_shares)
-        
-        sell_shares = st.number_input("Shares to Sell", min_value=1.0, step=1.0)
-        if st.button("Sell"):
-            sell_stock(selected_ticker, sell_shares)
+        st.subheader("Trade")
+        col1, col2 = st.columns(2)
+        with col1:
+            buy_shares = st.number_input("Shares to Buy", min_value=1.0, step=1.0, key=f"buy_shares_{selected_ticker}")
+            if st.button("Buy", key=f"buy_{selected_ticker}"):
+                buy_stock(selected_ticker, buy_shares)
+                st.experimental_rerun()
+        with col2:
+            sell_shares = st.number_input("Shares to Sell", min_value=1.0, step=1.0, key=f"sell_shares_{selected_ticker}")
+            if st.button("Sell", key=f"sell_{selected_ticker}"):
+                sell_stock(selected_ticker, sell_shares)
+                st.experimental_rerun()
 
-# View Portfolio
-if st.button("View Portfolio"):
+# Visualizations
+with st.container():
+    st.subheader("📊 Visual Insights")
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.markdown("**Average Technical Score by Sector**")
+        tech_score_avg = filtered_df.groupby('Sector')['Technical Score'].mean().reset_index()
+        tech_score_avg['Technical Score'] = tech_score_avg['Technical Score'].round(2)
+        fig_tech = go.Figure(data=[
+            go.Bar(x=tech_score_avg['Sector'], y=tech_score_avg['Technical Score'], marker_color='#FF6F61')
+        ])
+        fig_tech.update_layout(
+            title="Average Technical Score",
+            xaxis_title="Sector",
+            yaxis_title="Score",
+            template='plotly_white',
+            height=400,
+            title_x=0.5,
+            hovermode='closest'
+        )
+        fig_tech.update_traces(hovertemplate='Sector: %{x}<br>Score: %{y:.2f}')
+        st.plotly_chart(fig_tech, use_container_width=True)
+    
+    with col2:
+        st.markdown("**Average Fundamental Score by Sector**")
+        fund_score_avg = filtered_df.groupby('Sector')['Fundamental Score'].mean().reset_index()
+        fund_score_avg['Fundamental Score'] = fund_score_avg['Fundamental Score'].round(2)
+        fig_fund = go.Figure(data=[
+            go.Bar(x=fund_score_avg['Sector'], y=fund_score_avg['Fundamental Score'], marker_color='#6B728E')
+        ])
+        fig_fund.update_layout(
+            title="Average Fundamental Score",
+            xaxis_title="Sector",
+            yaxis_title="Score",
+            template='plotly_white',
+            height=400,
+            title_x=0.5,
+            hovermode='closest'
+        )
+        fig_fund.update_traces(hovertemplate='Sector: %{x}<br>Score: %{y:.2f}')
+        st.plotly_chart(fig_fund, use_container_width=True)
+
+# Portfolio
+if st.button("💸 View Portfolio"):
     view_portfolio()
 
 # Suggested Improvements for Screening Strategy
-st.subheader("Suggested Improvements for Screening Strategy")
+st.subheader("📝 Suggested Improvements for Screening Strategy")
 st.markdown("""
-Based on historical data and successful strategies:
-- **Value Strategy**: Focus on low P/E (<15), high ROE (>15%), low Debt/Equity (<1). Historical returns: ~17% annual (2015-2025 simulation).
-- **Growth Strategy**: High revenue growth (>10%), high earnings growth. Historical returns: up to 113% in 2024.
-- **Momentum Strategy**: High ROE, growing revenues. Zacks Big Money: 56.7% annual since 2000.
-- **CAN SLIM**: Growth stocks with strong fundamentals, 13.8% annual.
-- **App Improvements**: Add strategy presets (buttons like "Value", "Growth") that auto-apply filters. Implement backtesting using historical yfinance data to test strategies and show past performance (e.g., CAGR, Sharpe Ratio). Add AI-based strategy optimization using past returns.
+Based on historical data and successful strategies (2000-2025):
+- **Value Strategy**: Low P/E (<15), high ROE (>15%), low Debt/Equity (<1). Historical returns: ~17% annual (S&P 500 data, 2015-2025).
+- **Growth Strategy**: High revenue growth (>10%), high earnings growth (>15%). Historical returns: up to 113% in 2024 (tech-heavy portfolios).
+- **Momentum Strategy**: High ROE, growing revenues, positive technical signals (e.g., UT Bot 'Buy'). Zacks Big Money: 56.7% annual since 2000.
+- **CAN SLIM**: Growth stocks with strong fundamentals, momentum, and institutional support. Historical returns: ~13.8% annual.
+- **App Improvements**:
+  - Add **strategy preset buttons** (e.g., "Value", "Growth") to auto-apply filters like P/E < 15, Revenue Growth > 10%.
+  - Implement **backtesting module** using yfinance historical data to simulate strategies and display metrics (CAGR, Sharpe Ratio).
+  - Add **AI-based optimization** to suggest custom filters based on past performance.
+  - Include **portfolio performance tracking** with annualized returns and risk metrics.
 """)
 
 # Download option
-csv = filtered_df.to_csv()
-st.download_button("Download CSV", csv, "recommendations.csv", "text/csv")
+st.download_button(
+    label="📥 Download CSV",
+    data=filtered_df.to_csv(),
+    file_name="recommendations.csv",
+    mime="text/csv",
+    help="Download the filtered data as a CSV file"
+)
 
 # Footer
 st.markdown("---")
-st.markdown("**Note:** Uses yfinance for 5-year weekly data. Fundamentals are sector-adjusted. UT Bot uses a=3. Run with `streamlit run app.py`. Data cached in 'analysis_cache.csv'.")
-st.markdown("**Warning:** Processing 750 tickers may hit rate limits. Check error_log.txt for issues. Reduce ticker count or use an alternative API (e.g., Alpha Vantage) if errors occur.")
+st.markdown(f"""
+    **Note:** Uses yfinance for 5-year weekly data. Fundamentals are sector-adjusted. UT Bot uses a=3. Run with `streamlit run app.py`. Data cached in 'analysis_cache.csv'.
+    **Warning:** Processing 752 tickers may hit rate limits. Check error_log.txt for issues. Reduce ticker count or use an alternative API (e.g., Alpha Vantage) if errors occur.
+    **Developed by:** Your Name | Last Updated: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')}
+""")
