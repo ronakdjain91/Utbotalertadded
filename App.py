@@ -5,17 +5,15 @@ import numpy as np
 import os
 import time
 import random
-import plotly.express as px
 import plotly.graph_objects as go
 
 # File paths
 TICKERS_FILE = 'tickers.txt'
 CACHE_FILE = 'analysis_cache.csv'
-PORTFOLIO_FILE = 'portfolio.json'
 ERROR_LOG_FILE = 'error_log.txt'
 
 # Currency symbol
-CURRENCY_SYMBOL = '₹'  # Indian Rupee
+CURRENCY_SYMBOL = '₹'
 
 # Load tickers
 def load_tickers():
@@ -61,7 +59,7 @@ def rsi(series, period=14):
 
 # Technical scoring: SMA200, MACD, RSI, Volume
 def technical_score(hist):
-    if len(hist) < 100:  # Reduced from 200 to ~2 years of weekly data
+    if len(hist) < 100:
         return 5.0
     
     close = hist['Close']
@@ -322,7 +320,6 @@ def analyze_stocks(tickers, status_placeholder, progress_bar):
     total = len(tickers)
     failed_tickers = []
     
-    # Sequential data fetching
     status_placeholder.text("Fetching data sequentially...")
     progress_bar.progress(0.0)
     
@@ -343,8 +340,7 @@ def analyze_stocks(tickers, status_placeholder, progress_bar):
         progress_bar.progress(progress)
         status_placeholder.text(f"Fetching data {i + 1}/{total}: {ticker}")
     
-    # Check for excessive failures
-    if len(failed_tickers) / total > 0.1:  # More than 10% failure
+    if len(failed_tickers) / total > 0.1:
         status_placeholder.warning("High failure rate detected. Possible rate limit. Check error_log.txt and consider reducing tickers.")
     
     results = {}
@@ -370,21 +366,25 @@ def analyze_stocks(tickers, status_placeholder, progress_bar):
                 pe = info.get('trailingPE', np.nan)
                 earnings_growth = info.get('earningsGrowth', np.nan)
                 peg = pe / (earnings_growth * 100) if earnings_growth and earnings_growth > 0 else np.nan
+                debt_equity = info.get('debtToEquity', np.nan)
+                roe = info.get('returnOnEquity', np.nan)
+                dividend_yield = info.get('dividendYield', np.nan)
+                revenue_growth = info.get('revenueGrowth', np.nan)
+                
+                rsi_val = rsi(hist['Close'], 14).iloc[-1]
+                macd_val = (hist['Close'].ewm(span=12, adjust=False).mean() - hist['Close'].ewm(span=26, adjust=False).mean()).iloc[-1]
+                sma200 = hist['Close'].rolling(window=200).mean().iloc[-1]
+                vol_ratio = hist['Volume'].iloc[-1] / hist['Volume'].rolling(window=50).mean().iloc[-1]
+                
+                fundamental_data = f"P/E: {round(pe, 2)}, PEG: {round(peg, 2)}, Debt/Equity: {round(debt_equity, 2)}, ROE: {round(roe, 2)}, Dividend Yield: {round(dividend_yield, 2)}, Revenue Growth: {round(revenue_growth, 2)}"
+                technical_data = f"RSI: {round(rsi_val, 0)}, MACD: {round(macd_val, 2)}, SMA200: {round(sma200, 2)}, Volume vs SMA50: {round(vol_ratio, 0)}"
                 
                 results[ticker] = {
                     'Sector': sector,
                     'Fundamental Score': round(f_score, 2),
-                    'P/E Ratio': round(pe, 2),
-                    'PEG Ratio': round(peg, 2),
-                    'Debt/Equity': round(info.get('debtToEquity', np.nan), 2),
-                    'ROE': round(info.get('returnOnEquity', np.nan), 2),
-                    'Dividend Yield': round(info.get('dividendYield', np.nan), 2),
-                    'Revenue Growth': round(info.get('revenueGrowth', np.nan), 2),
+                    'Fundamental Data': fundamental_data,
                     'Technical Score': round(t_score, 2),
-                    'RSI': round(rsi(hist['Close'], 14).iloc[-1], 0),
-                    'MACD': round((hist['Close'].ewm(span=12, adjust=False).mean() - hist['Close'].ewm(span=26, adjust=False).mean()).iloc[-1], 2),
-                    'SMA200': round(hist['Close'].rolling(window=200).mean().iloc[-1], 2),
-                    'Volume vs SMA50': round(hist['Volume'].iloc[-1] / hist['Volume'].rolling(window=50).mean().iloc[-1], 0),
+                    'Technical Data': technical_data,
                     'UT Bot Signal': ut_signal,
                     'EMA 200 Signal': ema_signal,
                     'MACD Signal': macd_sig,
@@ -417,86 +417,6 @@ def load_cache():
         return pd.read_csv(CACHE_FILE, index_col='Ticker')
     return None
 
-# Paper trading functions
-def initialize_portfolio():
-    if 'portfolio' not in st.session_state:
-        st.session_state.portfolio = {
-            'cash': 100000.0,
-            'holdings': {}
-        }
-
-def view_portfolio():
-    portfolio = st.session_state.portfolio
-    cash = portfolio['cash']
-    holdings = portfolio['holdings']
-    total_value = cash
-    df_holdings = []
-    
-    for ticker, data in holdings.items():
-        try:
-            current_price = yf.Ticker(ticker).history(period='1d')['Close'].iloc[-1]
-            value = data['shares'] * current_price
-            pnl = value - (data['shares'] * data['avg_buy_price'])
-            df_holdings.append({
-                'Ticker': ticker,
-                'Shares': data['shares'],
-                'Avg Buy Price': round(data['avg_buy_price'], 2),
-                'Current Price': round(current_price, 2),
-                'Value': round(value, 2),
-                'P&L': round(pnl, 2)
-            })
-            total_value += value
-        except Exception as e:
-            st.warning(f"Error fetching price for {ticker}: {e}")
-            log_error(f"Error fetching portfolio price for {ticker}: {e}")
-    
-    if df_holdings:
-        st.dataframe(pd.DataFrame(df_holdings))
-    else:
-        st.info("No holdings yet.")
-    
-    st.write(f"Cash: {CURRENCY_SYMBOL}{cash:.2f}")
-    st.write(f"Total Portfolio Value: {CURRENCY_SYMBOL}{total_value:.2f}")
-
-def buy_stock(ticker, shares):
-    portfolio = st.session_state.portfolio
-    try:
-        price = yf.Ticker(ticker).history(period='1d')['Close'].iloc[-1]
-        cost = shares * price
-        if cost > portfolio['cash']:
-            st.error("Insufficient cash")
-            return
-        portfolio['cash'] -= cost
-        if ticker in portfolio['holdings']:
-            old_shares = portfolio['holdings'][ticker]['shares']
-            old_cost = old_shares * portfolio['holdings'][ticker]['avg_buy_price']
-            new_shares = old_shares + shares
-            new_avg = (old_cost + cost) / new_shares
-            portfolio['holdings'][ticker] = {'shares': new_shares, 'avg_buy_price': new_avg}
-        else:
-            portfolio['holdings'][ticker] = {'shares': shares, 'avg_buy_price': price}
-        st.success(f"Bought {shares} shares of {ticker} @ {CURRENCY_SYMBOL}{price:.2f}")
-    except Exception as e:
-        st.error(f"Error buying {ticker}: {e}")
-        log_error(f"Error buying {ticker}: {e}")
-
-def sell_stock(ticker, shares):
-    portfolio = st.session_state.portfolio
-    if ticker not in portfolio['holdings'] or shares > portfolio['holdings'][ticker]['shares']:
-        st.error("Insufficient shares or not held")
-        return
-    try:
-        price = yf.Ticker(ticker).history(period='1d')['Close'].iloc[-1]
-        revenue = shares * price
-        portfolio['cash'] += revenue
-        portfolio['holdings'][ticker]['shares'] -= shares
-        if portfolio['holdings'][ticker]['shares'] <= 0:
-            del portfolio['holdings'][ticker]
-        st.success(f"Sold {shares} shares of {ticker} @ {CURRENCY_SYMBOL}{price:.2f}")
-    except Exception as e:
-        st.error(f"Error selling {ticker}: {e}")
-        log_error(f"Error selling {ticker}: {e}")
-
 # Main Streamlit App
 st.set_page_config(page_title="Stock Analysis & Paper Trading App", layout="wide")
 
@@ -510,148 +430,135 @@ except Exception as e:
     st.error(str(e))
     st.stop()
 
-# Tabs
-tab1, tab2 = st.tabs(["Stock Analysis", "Paper Trading"])
+# Status and progress placeholders
+status_placeholder = st.empty()
+progress_bar = st.progress(0.0)
 
-with tab1:
-    st.header("Stock Analysis")
-    
-    # Status and progress placeholders
-    status_placeholder = st.empty()
-    progress_bar = st.progress(0.0)
-    
-    # Load cache on start
-    cached_df = load_cache()
-    if cached_df is not None:
-        last_updated = cached_df['Last Updated'].iloc[0] if 'Last Updated' in cached_df.columns else "Unknown"
-        st.info(f"Showing cached data (last updated: {last_updated}). Click 'Refresh Data' to update.")
-    
-    # Refresh button
-    if st.button("Refresh Data"):
-        status_placeholder.info("Processing data... UI will be unresponsive until complete.")
-        df = analyze_stocks(tickers, status_placeholder, progress_bar)
-        if df is not None:
-            st.session_state.df = df
-        else:
-            st.error("Analysis failed. Check error_log.txt for details.")
-    
-    # Load data
-    if 'df' in st.session_state:
-        df = st.session_state.df
-    elif cached_df is not None:
-        df = cached_df
+# Load cache on start
+cached_df = load_cache()
+if cached_df is not None:
+    last_updated = cached_df['Last Updated'].iloc[0] if 'Last Updated' in cached_df.columns else "Unknown"
+    st.info(f"Showing cached data (last updated: {last_updated}). Click 'Refresh Data' to update.")
+
+# Refresh button
+if st.button("Refresh Data"):
+    status_placeholder.info("Processing data... UI will be unresponsive until complete.")
+    df = analyze_stocks(tickers, status_placeholder, progress_bar)
+    if df is not None:
+        st.session_state.df = df
     else:
-        st.info("No data available. Click 'Refresh Data' to analyze stocks.")
-        st.stop()
-    
-    # Cache expiration check
-    if 'Last Updated' in df.columns:
-        cache_age = (pd.Timestamp.now() - pd.to_datetime(df['Last Updated'].iloc[0])).total_seconds() / 3600
-        if cache_age > 24:
-            st.warning("Cached data is over 24 hours old. Please refresh.")
-    
-    # Filters in sidebar
-    st.sidebar.header("Filters")
-    unique_sectors = sorted(df['Sector'].unique())
-    selected_sectors = st.sidebar.multiselect("Sectors", unique_sectors, default=unique_sectors)
-    
-    unique_recs = sorted(df['Recommendation'].unique())
-    selected_recs = st.sidebar.multiselect("Recommendations", unique_recs, default=unique_recs)
-    
-    unique_ut = sorted(df['UT Bot Signal'].unique())
-    selected_ut = st.sidebar.multiselect("UT Bot Signals", unique_ut, default=unique_ut)
-    
-    unique_ema = sorted(df['EMA 200 Signal'].unique())
-    selected_ema = st.sidebar.multiselect("EMA 200 Signals", unique_ema, default=unique_ema)
-    
-    unique_macd = sorted(df['MACD Signal'].unique())
-    selected_macd = st.sidebar.multiselect("MACD Signals", unique_macd, default=unique_macd)
-    
-    min_f_score, max_f_score = st.sidebar.slider("Fundamental Score Range", 0.0, 10.0, (0.0, 10.0))
-    min_t_score, max_t_score = st.sidebar.slider("Technical Score Range", 0.0, 10.0, (0.0, 10.0))
-    min_price, max_price = st.sidebar.slider("Price Range", float(df['Price'].min()), float(df['Price'].max()), (float(df['Price'].min()), float(df['Price'].max())))
-    
-    # Apply filters
-    filtered_df = df[
-        (df['Sector'].isin(selected_sectors)) &
-        (df['Recommendation'].isin(selected_recs)) &
-        (df['UT Bot Signal'].isin(selected_ut)) &
-        (df['EMA 200 Signal'].isin(selected_ema)) &
-        (df['MACD Signal'].isin(selected_macd)) &
-        (df['Fundamental Score'].between(min_f_score, max_f_score)) &
-        (df['Technical Score'].between(min_t_score, max_t_score)) &
-        (df['Price'].between(min_price, max_price))
-    ]
-    
-    # Reorder columns
-    columns = ['Sector', 'Fundamental Score', 'UT Bot Signal', 'EMA 200 Signal', 'MACD Signal', 'Technical Score', 'Recommendation', 'Price', 'TradingView Link']
-    filtered_df = filtered_df[columns]
-    
-    # Display table
-    st.subheader("Filtered Recommendations")
-    def make_clickable(link):
-        if link:
-            return f'<a href="{link}" target="_blank">Chart</a>'
-        return ''
-    
-    styled_df = filtered_df.style.format({'TradingView Link': make_clickable})
-    st.write(styled_df, unsafe_allow_html=True)
-    
-    # Visualizations with improved attractiveness
-    st.subheader("Recommendation Distribution by Sector")
-    rec_counts = filtered_df.groupby(['Sector', 'Recommendation']).size().unstack(fill_value=0)
-    fig = px.bar(rec_counts, barmode='stack', title="Recommendations by Sector", color_discrete_sequence=px.colors.qualitative.Pastel)
-    fig.update_layout(template='plotly_dark', xaxis_title='Sector', yaxis_title='Count')
-    st.plotly_chart(fig, use_container_width=True)
-    
-    st.subheader("Technical Score Distribution by Sector")
-    tech_score_avg = filtered_df.groupby('Sector')['Technical Score'].mean().reset_index()
-    tech_score_avg['Technical Score'] = tech_score_avg['Technical Score'].round(2)
-    fig_tech = px.bar(tech_score_avg, x='Sector', y='Technical Score', title="Average Technical Score by Sector", color='Sector', color_discrete_sequence=px.colors.qualitative.Pastel)
-    fig_tech.update_layout(template='plotly_dark', xaxis_title='Sector', yaxis_title='Average Technical Score')
-    st.plotly_chart(fig_tech, use_container_width=True)
-    
-    st.subheader("Fundamental Score Distribution by Sector")
-    fund_score_avg = filtered_df.groupby('Sector')['Fundamental Score'].mean().reset_index()
-    fund_score_avg['Fundamental Score'] = fund_score_avg['Fundamental Score'].round(2)
-    fig_fund = px.bar(fund_score_avg, x='Sector', y='Fundamental Score', title="Average Fundamental Score by Sector", color='Sector', color_discrete_sequence=px.colors.qualitative.Pastel)
-    fig_fund.update_layout(template='plotly_dark', xaxis_title='Sector', yaxis_title='Average Fundamental Score')
-    st.plotly_chart(fig_fund, use_container_width=True)
-    
-    st.subheader("UT Bot Signal Distribution by Sector")
-    ut_counts = filtered_df.groupby(['Sector', 'UT Bot Signal']).size().unstack(fill_value=0)
-    fig_ut = px.bar(ut_counts, barmode='stack', title="UT Bot Signals by Sector", color_discrete_sequence=px.colors.qualitative.Pastel)
-    fig_ut.update_layout(template='plotly_dark', xaxis_title='Sector', yaxis_title='Count')
-    st.plotly_chart(fig_ut, use_container_width=True)
-    
-    # Download option
-    csv = filtered_df.to_csv()
-    st.download_button("Download CSV", csv, "recommendations.csv", "text/csv")
+        st.error("Analysis failed. Check error_log.txt for details.")
 
-with tab2:
-    st.header("Paper Trading")
-    initialize_portfolio()
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.subheader("Buy Stock")
-        buy_ticker = st.text_input("Ticker to Buy")
+# Load data
+if 'df' in st.session_state:
+    df = st.session_state.df
+elif cached_df is not None:
+    df = cached_df
+else:
+    st.info("No data available. Click 'Refresh Data' to analyze stocks.")
+    st.stop()
+
+# Cache expiration check
+if 'Last Updated' in df.columns:
+    cache_age = (pd.Timestamp.now() - pd.to_datetime(df['Last Updated'].iloc[0])).total_seconds() / 3600
+    if cache_age > 24:
+        st.warning("Cached data is over 24 hours old. Please refresh.")
+
+# Filters in sidebar
+st.sidebar.header("Filters")
+unique_sectors = sorted(df['Sector'].unique())
+selected_sectors = st.sidebar.multiselect("Sectors", unique_sectors, default=unique_sectors)
+
+unique_recs = sorted(df['Recommendation'].unique())
+selected_recs = st.sidebar.multiselect("Recommendations", unique_recs, default=['Buy', 'Bullish'])
+
+unique_ut = sorted(df['UT Bot Signal'].unique())
+selected_ut = st.sidebar.multiselect("UT Bot Signals", unique_ut, default=unique_ut)
+
+unique_ema = sorted(df['EMA 200 Signal'].unique())
+selected_ema = st.sidebar.multiselect("EMA 200 Signals", unique_ema, default=unique_ema)
+
+unique_macd = sorted(df['MACD Signal'].unique())
+selected_macd = st.sidebar.multiselect("MACD Signals", unique_macd, default=unique_macd)
+
+min_f_score, max_f_score = st.sidebar.slider("Fundamental Score Range", 0.0, 10.0, (0.0, 10.0))
+min_t_score, max_t_score = st.sidebar.slider("Technical Score Range", 0.0, 10.0, (0.0, 10.0))
+min_price, max_price = st.sidebar.slider("Price Range", float(df['Price'].min()), float(df['Price'].max()), (float(df['Price'].min()), float(df['Price'].max())))
+
+# Apply filters
+filtered_df = df[
+    (df['Sector'].isin(selected_sectors)) &
+    (df['Recommendation'].isin(selected_recs)) &
+    (df['UT Bot Signal'].isin(selected_ut)) &
+    (df['EMA 200 Signal'].isin(selected_ema)) &
+    (df['MACD Signal'].isin(selected_macd)) &
+    (df['Fundamental Score'].between(min_f_score, max_f_score)) &
+    (df['Technical Score'].between(min_t_score, max_t_score)) &
+    (df['Price'].between(min_price, max_price))
+]
+
+# Reorder columns
+columns = ['Sector', 'Fundamental Score', 'UT Bot Signal', 'EMA 200 Signal', 'MACD Signal', 'Technical Score', 'Recommendation', 'Price', 'TradingView Link']
+filtered_df = filtered_df[columns]
+
+# Display table
+st.subheader("Filtered Recommendations")
+def make_clickable(link):
+    if link:
+        return f'<a href="{link}" target="_blank">Chart</a>'
+    return ''
+
+styled_df = filtered_df.style.format({'TradingView Link': make_clickable})
+st.write(styled_df, unsafe_allow_html=True)
+
+# Ticker details and paper trading
+st.subheader("Select Ticker for Details and Trading")
+selected_ticker = st.selectbox("Select Ticker", filtered_df.index)
+
+if selected_ticker:
+    with st.expander(f"Details for {selected_ticker}"):
+        row = filtered_df.loc[selected_ticker]
+        st.write(row)
+        
+        # Price chart
+        hist = yf.Ticker(selected_ticker).history(period='1y')
+        fig = go.Figure(data=[go.Candlestick(x=hist.index,
+                                             open=hist['Open'],
+                                             high=hist['High'],
+                                             low=hist['Low'],
+                                             close=hist['Close'])])
+        fig.update_layout(title=f"{selected_ticker} Price Chart", xaxis_title="Date", yaxis_title="Price", xaxis_rangeslider_visible=True)
+        st.plotly_chart(fig)
+        
+        # Buy/Sell forms
         buy_shares = st.number_input("Shares to Buy", min_value=1.0, step=1.0)
         if st.button("Buy"):
-            buy_stock(buy_ticker.upper(), buy_shares)
-    
-    with col2:
-        st.subheader("Sell Stock")
-        sell_ticker = st.text_input("Ticker to Sell")
+            buy_stock(selected_ticker, buy_shares)
+        
         sell_shares = st.number_input("Shares to Sell", min_value=1.0, step=1.0)
         if st.button("Sell"):
-            sell_stock(sell_ticker.upper(), sell_shares)
-    
-    st.subheader("Portfolio")
+            sell_stock(selected_ticker, sell_shares)
+
+# View Portfolio
+if st.button("View Portfolio"):
     view_portfolio()
+
+# Suggested Improvements for Screening Strategy
+st.subheader("Suggested Improvements for Screening Strategy")
+st.markdown("""
+Based on historical data and successful strategies:
+- **Value Strategy**: Focus on low P/E (<15), high ROE (>15%), low Debt/Equity (<1). Historical returns: ~17% annual (2015-2025 simulation).
+- **Growth Strategy**: High revenue growth (>10%), high earnings growth. Historical returns: up to 113% in 2024.
+- **Momentum Strategy**: High ROE, growing revenues. Zacks Big Money: 56.7% annual since 2000.
+- **CAN SLIM**: Growth stocks with strong fundamentals, 13.8% annual.
+- **App Improvements**: Add strategy presets (buttons like "Value", "Growth") that auto-apply filters. Implement backtesting using historical yfinance data to test strategies and show past performance (e.g., CAGR, Sharpe Ratio). Add AI-based strategy optimization using past returns.
+""")
+
+# Download option
+csv = filtered_df.to_csv()
+st.download_button("Download CSV", csv, "recommendations.csv", "text/csv")
 
 # Footer
 st.markdown("---")
-st.markdown("**Note:** Uses yfinance for 5-year weekly data to ensure sufficient history for indicators. Fundamentals are sector-adjusted. UT Bot uses a=3. Run with `streamlit run app.py`. Data cached in 'analysis_cache.csv'.")
+st.markdown("**Note:** Uses yfinance for 5-year weekly data. Fundamentals are sector-adjusted. UT Bot uses a=3. Run with `streamlit run app.py`. Data cached in 'analysis_cache.csv'.")
 st.markdown("**Warning:** Processing 750 tickers may hit rate limits. Check error_log.txt for issues. Reduce ticker count or use an alternative API (e.g., Alpha Vantage) if errors occur.")
