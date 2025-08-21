@@ -7,6 +7,7 @@ import os
 import time
 import random
 import plotly.express as px
+import plotly.graph_objects as go
 
 # File paths
 TICKERS_FILE = 'tickers.txt'
@@ -27,12 +28,12 @@ def log_error(message):
         timestamp = pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')
         f.write(f"[{timestamp}] {message}\n")
 
-# Fetch data with retry mechanism (3 years, weekly data)
+# Fetch data with retry mechanism (5 years to ensure enough data for SMA200)
 def get_data(ticker, retries=3):
     for attempt in range(retries):
         try:
             stock = yf.Ticker(ticker)
-            hist = stock.history(period='3y', interval='1wk')
+            hist = stock.history(period='5y', interval='1wk')
             if hist.empty:
                 raise ValueError(f"No historical data for {ticker}")
             info = stock.info
@@ -85,23 +86,72 @@ def technical_score(hist):
     normalized_score = (raw_score + 1) * 5
     return normalized_score
 
-# UT Bot Alert Signal (sensitivity a=3, weekly data)
+# EMA 200 crossover signal
+def ema200_signal(hist):
+    close = hist['Close']
+    ema200 = close.ewm(span=200, adjust=False).mean()
+    current_price = close.iloc[-1]
+    prev_price = close.iloc[-2]
+    current_ema = ema200.iloc[-1]
+    prev_ema = ema200.iloc[-2]
+    
+    if current_price > current_ema and prev_price <= prev_ema:
+        return 'Buy'
+    elif current_price < current_ema and prev_price >= prev_ema:
+        return 'Sell'
+    elif current_price > current_ema:
+        return 'Bullish'
+    elif current_price < current_ema:
+        return 'Bearish'
+    else:
+        return 'Neutral'
+
+# MACD crossover signal
+def macd_signal(hist):
+    close = hist['Close']
+    exp12 = close.ewm(span=12, adjust=False).mean()
+    exp26 = close.ewm(span=26, adjust=False).mean()
+    macd_line = exp12 - exp26
+    signal_line = macd_line.ewm(span=9, adjust=False).mean()
+    
+    current_macd = macd_line.iloc[-1]
+    prev_macd = macd_line.iloc[-2]
+    current_signal = signal_line.iloc[-1]
+    prev_signal = signal_line.iloc[-2]
+    
+    if current_macd > current_signal and prev_macd <= prev_signal:
+        return 'Buy'
+    elif current_macd < current_signal and prev_macd >= prev_signal:
+        return 'Sell'
+    elif current_macd > current_signal:
+        return 'Bullish'
+    elif current_macd < current_signal:
+        return 'Bearish'
+    else:
+        return 'Neutral'
+
+# UT Bot Alert Signal (sensitivity a=3, weekly data) - Adjusted to match TradingView logic
 def ut_bot_signal(hist, a=3, c=10):
     close = hist['Close']
     high = hist['High']
     low = hist['Low']
     
-    prev_close = close.shift(1)
-    tr = pd.concat([high - low, abs(high - prev_close), abs(low - prev_close)], axis=1).max(axis=1)
-    atr = tr.rolling(window=c).mean()
+    # True Range and ATR
+    tr = pd.DataFrame(index=hist.index)
+    tr['tr1'] = high - low
+    tr['tr2'] = abs(high - close.shift(1))
+    tr['tr3'] = abs(low - close.shift(1))
+    tr['tr'] = tr.max(axis=1)
+    atr = tr['tr'].rolling(window=c).mean()
     
     nloss = a * atr
     
-    ts = pd.Series(np.nan, index=close.index)
-    for i in range(1, len(close)):
-        if pd.isna(ts[i-1]):
-            ts[i] = close[i] + nloss[i] if close[i] < close[i-1] else close[i] - nloss[i]
-        elif close[i] > ts[i-1] and close[i-1] > ts[i-1]:
+    # Trailing Stop
+    ts = pd.Series(np.nan, index=hist.index)
+    pos = pd.Series(0, index=hist.index)
+    ts[0] = close[0]
+    for i in range(1, len(hist)):
+        if close[i] > ts[i-1] and close[i-1] > ts[i-1]:
             ts[i] = max(ts[i-1], close[i] - nloss[i])
         elif close[i] < ts[i-1] and close[i-1] < ts[i-1]:
             ts[i] = min(ts[i-1], close[i] + nloss[i])
@@ -109,9 +159,8 @@ def ut_bot_signal(hist, a=3, c=10):
             ts[i] = close[i] - nloss[i]
         else:
             ts[i] = close[i] + nloss[i]
-    
-    pos = pd.Series(0, index=close.index)
-    for i in range(1, len(close)):
+        
+        # Position
         if close[i-1] < ts[i-1] and close[i] > ts[i-1]:
             pos[i] = 1
         elif close[i-1] > ts[i-1] and close[i] < ts[i-1]:
@@ -119,6 +168,7 @@ def ut_bot_signal(hist, a=3, c=10):
         else:
             pos[i] = pos[i-1]
     
+    # Crossovers
     above = (close > ts.shift(1)) & (close.shift(1) <= ts.shift(1))
     below = (close < ts.shift(1)) & (close.shift(1) >= ts.shift(1))
     
@@ -313,6 +363,8 @@ def analyze_stocks(tickers, status_placeholder, progress_bar):
                 t_score = technical_score(hist)
                 f_score = fundamental_score(info, sector_medians)
                 ut_signal = ut_bot_signal(hist, a=3)
+                ema_signal = ema200_signal(hist)
+                macd_sig = macd_signal(hist)
                 rec = get_recommendation(f_score, t_score, ut_signal)
                 current_price = hist['Close'].iloc[-1]
                 sector = info.get('sector', 'Unknown')
@@ -322,6 +374,8 @@ def analyze_stocks(tickers, status_placeholder, progress_bar):
                     'Fundamental Score': round(f_score, 2),
                     'Technical Score': round(t_score, 2),
                     'UT Bot Signal': ut_signal,
+                    'EMA 200 Signal': ema_signal,
+                    'MACD Signal': macd_sig,
                     'Recommendation': rec,
                     'Price': round(current_price, 2),
                     'TradingView Link': f"https://www.tradingview.com/chart/?symbol={ticker}" if rec in ['Buy', 'Sell'] else ''
@@ -510,7 +564,7 @@ with tab1:
     ]
     
     # Reorder columns
-    columns = ['Sector', 'Fundamental Score', 'UT Bot Signal', 'Technical Score', 'Recommendation', 'Price', 'TradingView Link']
+    columns = ['Sector', 'Fundamental Score', 'UT Bot Signal', 'Technical Score', 'EMA 200 Signal', 'MACD Signal', 'Recommendation', 'Price', 'TradingView Link']
     filtered_df = filtered_df[columns]
     
     # Display table
@@ -558,5 +612,5 @@ with tab2:
 
 # Footer
 st.markdown("---")
-st.markdown("**Note:** Uses yfinance for 3-year weekly data with sequential fetching. Fundamentals are sector-adjusted. UT Bot uses a=3. Run with `streamlit run app.py`. Data cached in 'analysis_cache.csv'.")
+st.markdown("**Note:** Uses yfinance for 5-year weekly data to ensure sufficient history for indicators. Fundamentals are sector-adjusted. UT Bot uses a=3. Run with `streamlit run app.py`. Data cached in 'analysis_cache.csv'.")
 st.markdown("**Warning:** Processing 750 tickers may hit rate limits. Check error_log.txt for issues. Reduce ticker count or use an alternative API (e.g., Alpha Vantage) if errors occur.")
