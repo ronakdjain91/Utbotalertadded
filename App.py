@@ -147,23 +147,24 @@ def ut_bot_signal(hist, a=3, c=10):
     
     ts = pd.Series(np.nan, index=hist.index)
     pos = pd.Series(0, index=hist.index)
-    ts[0] = close[0]
+    # Use positional indexing to avoid datetime-index pitfalls
+    ts.iloc[0] = close.iloc[0]
     for i in range(1, len(hist)):
-        if close[i] > ts[i-1] and close[i-1] > ts[i-1]:
-            ts[i] = max(ts[i-1], close[i] - nloss[i])
-        elif close[i] < ts[i-1] and close[i-1] < ts[i-1]:
-            ts[i] = min(ts[i-1], close[i] + nloss[i])
-        elif close[i] > ts[i-1]:
-            ts[i] = close[i] - nloss[i]
+        if close.iloc[i] > ts.iloc[i-1] and close.iloc[i-1] > ts.iloc[i-1]:
+            ts.iloc[i] = max(ts.iloc[i-1], close.iloc[i] - nloss.iloc[i])
+        elif close.iloc[i] < ts.iloc[i-1] and close.iloc[i-1] < ts.iloc[i-1]:
+            ts.iloc[i] = min(ts.iloc[i-1], close.iloc[i] + nloss.iloc[i])
+        elif close.iloc[i] > ts.iloc[i-1]:
+            ts.iloc[i] = close.iloc[i] - nloss.iloc[i]
         else:
-            ts[i] = close[i] + nloss[i]
+            ts.iloc[i] = close.iloc[i] + nloss.iloc[i]
         
-        if close[i-1] < ts[i-1] and close[i] > ts[i-1]:
-            pos[i] = 1
-        elif close[i-1] > ts[i-1] and close[i] < ts[i-1]:
-            pos[i] = -1
+        if close.iloc[i-1] < ts.iloc[i-1] and close.iloc[i] > ts.iloc[i-1]:
+            pos.iloc[i] = 1
+        elif close.iloc[i-1] > ts.iloc[i-1] and close.iloc[i] < ts.iloc[i-1]:
+            pos.iloc[i] = -1
         else:
-            pos[i] = pos[i-1]
+            pos.iloc[i] = pos.iloc[i-1]
     
     above = (close > ts.shift(1)) & (close.shift(1) <= ts.shift(1))
     below = (close < ts.shift(1)) & (close.shift(1) >= ts.shift(1))
@@ -181,6 +182,139 @@ def ut_bot_signal(hist, a=3, c=10):
         return 'Bearish'
     else:
         return 'Neutral'
+
+# Factor and composite scoring helpers
+
+def compute_max_drawdown(close, lookback=104):
+    series = close.tail(lookback)
+    rolling_peak = series.cummax()
+    drawdown = (series / rolling_peak) - 1.0
+    return float(drawdown.min()) if len(drawdown) > 0 else np.nan
+
+
+def compute_factor_metrics(hist):
+    close = hist['Close']
+    volume = hist['Volume']
+    # Momentum
+    mom_12m = close.pct_change(52).iloc[-1] if len(close) >= 53 else np.nan
+    mom_6m = close.pct_change(26).iloc[-1] if len(close) >= 27 else np.nan
+    # Volatility (annualized from weekly returns over 52 weeks)
+    weekly_rets = close.pct_change().dropna()
+    vol_ann = weekly_rets.tail(52).std() * np.sqrt(52) if len(weekly_rets) > 0 else np.nan
+    # Max drawdown over last ~2 years
+    mdd = compute_max_drawdown(close, lookback=104)
+    # Liquidity: average weekly dollar volume over last 20 weeks
+    adv_20w = (close * volume).rolling(20).mean().iloc[-1] if len(close) >= 20 else np.nan
+    # 52W high proximity
+    hh_52w = close.rolling(52).max().iloc[-1] if len(close) >= 52 else np.nan
+    prox_52w_high = (close.iloc[-1] / hh_52w) if hh_52w and not np.isnan(hh_52w) and hh_52w != 0 else np.nan
+    return {
+        'Mom 12M': float(mom_12m) if mom_12m is not None else np.nan,
+        'Mom 6M': float(mom_6m) if mom_6m is not None else np.nan,
+        'Volatility (Ann)': float(vol_ann) if vol_ann is not None else np.nan,
+        'Max Drawdown': float(mdd) if mdd is not None else np.nan,
+        'ADV (20w)': float(adv_20w) if adv_20w is not None else np.nan,
+        '52W High %': float(prox_52w_high) if prox_52w_high is not None else np.nan
+    }
+
+
+def _pct_rank(series, ascending=True):
+    try:
+        return series.rank(pct=True, ascending=ascending)
+    except Exception:
+        return pd.Series(np.nan, index=series.index)
+
+
+def compute_composite_scores(df):
+    # Ensure numeric types
+    for col in ['P/E Ratio','PEG Ratio','Debt/Equity','ROE','Dividend Yield','Revenue Growth',
+                'Mom 12M','Mom 6M','Volatility (Ann)','Max Drawdown','ADV (20w)','52W High %']:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+    # Value: low PE, low D/E, high Dividend Yield
+    val_components = []
+    if 'P/E Ratio' in df.columns:
+        val_components.append(1 - _pct_rank(df['P/E Ratio']).fillna(0.5))
+    if 'Debt/Equity' in df.columns:
+        val_components.append(1 - _pct_rank(df['Debt/Equity']).fillna(0.5))
+    if 'Dividend Yield' in df.columns:
+        val_components.append(_pct_rank(df['Dividend Yield'], ascending=False).fillna(0.5))
+    df['Score Value'] = (pd.concat(val_components, axis=1).mean(axis=1) if val_components else 0.5) * 100
+    # Growth: high Revenue Growth, high Earnings Growth, low PEG
+    gro_components = []
+    if 'Revenue Growth' in df.columns:
+        gro_components.append(_pct_rank(df['Revenue Growth'], ascending=False).fillna(0.5))
+    if 'PEG Ratio' in df.columns:
+        gro_components.append(1 - _pct_rank(df['PEG Ratio']).fillna(0.5))
+    if 'Fundamental Data' in df.columns and 'earningsGrowth' in 'Fundamental Data':
+        pass
+    # We already have earningsGrowth numeric captured separately if available
+    # Quality: high ROE, low D/E
+    qlt_components = []
+    if 'ROE' in df.columns:
+        qlt_components.append(_pct_rank(df['ROE'], ascending=False).fillna(0.5))
+    if 'Debt/Equity' in df.columns:
+        qlt_components.append(1 - _pct_rank(df['Debt/Equity']).fillna(0.5))
+    df['Score Quality'] = (pd.concat(qlt_components, axis=1).mean(axis=1) if qlt_components else 0.5) * 100
+    # Momentum: 12M, 6M, proximity to 52W high
+    mom_components = []
+    if 'Mom 12M' in df.columns:
+        mom_components.append(_pct_rank(df['Mom 12M'], ascending=False).fillna(0.5))
+    if 'Mom 6M' in df.columns:
+        mom_components.append(_pct_rank(df['Mom 6M'], ascending=False).fillna(0.5))
+    if '52W High %' in df.columns:
+        mom_components.append(_pct_rank(df['52W High %'], ascending=False).fillna(0.5))
+    df['Score Momentum'] = (pd.concat(mom_components, axis=1).mean(axis=1) if mom_components else 0.5) * 100
+    # Low Volatility: low vol, low max drawdown
+    lv_components = []
+    if 'Volatility (Ann)' in df.columns:
+        lv_components.append(1 - _pct_rank(df['Volatility (Ann)']).fillna(0.5))
+    if 'Max Drawdown' in df.columns:
+        lv_components.append(1 - _pct_rank(df['Max Drawdown']).fillna(0.5))
+    df['Score LowVol'] = (pd.concat(lv_components, axis=1).mean(axis=1) if lv_components else 0.5) * 100
+    # Liquidity: high ADV
+    liq_components = []
+    if 'ADV (20w)' in df.columns:
+        liq_components.append(_pct_rank(df['ADV (20w)'], ascending=False).fillna(0.5))
+    df['Score Liquidity'] = (pd.concat(liq_components, axis=1).mean(axis=1) if liq_components else 0.5) * 100
+    # Composite: blend Value, Growth, Quality, Momentum, LowVol with weights
+    weights = {
+        'Score Value': 0.2,
+        'Score Growth': 0.2,
+        'Score Quality': 0.2,
+        'Score Momentum': 0.25,
+        'Score LowVol': 0.1,
+        'Score Liquidity': 0.05
+    }
+    # Ensure Score Growth exists
+    if 'Score Growth' not in df.columns:
+        # Approximate growth using revenue growth if needed
+        approx = _pct_rank(df.get('Revenue Growth', pd.Series(np.nan, index=df.index)), ascending=False).fillna(0.5) * 100
+        df['Score Growth'] = approx
+    composite = 0
+    for k, w in weights.items():
+        if k in df.columns:
+            composite = composite + (df[k].fillna(50) * w)
+    df['Composite Score'] = composite
+    return df
+
+
+def get_recommendation_v2(row):
+    comp = row.get('Composite Score', np.nan)
+    ut = row.get('UT Bot Signal', 'Neutral')
+    ema = row.get('EMA 200 Signal', 'Neutral')
+    price = row.get('Price', np.nan)
+    sma200 = row.get('SMA200', np.nan)
+    buy_like = (ut in ['Buy','Bullish']) and (ema in ['Buy','Bullish']) and (not np.isnan(price) and not np.isnan(sma200) and price >= sma200)
+    sell_like = (ut == 'Sell') or (ema == 'Sell') or (not np.isnan(price) and not np.isnan(sma200) and price < sma200)
+    if not np.isnan(comp):
+        if comp >= 70 and buy_like:
+            return 'Buy'
+        elif comp <= 30 and sell_like:
+            return 'Sell'
+        else:
+            return 'Hold'
+    return row.get('Recommendation', 'Hold')
 
 # Fundamental scoring: Sector comparison
 def fundamental_score(info, sector_medians):
@@ -375,6 +509,8 @@ def analyze_stocks(tickers, status_placeholder, progress_bar):
                 macd_val = (hist['Close'].ewm(span=12, adjust=False).mean() - hist['Close'].ewm(span=26, adjust=False).mean()).iloc[-1]
                 sma200 = hist['Close'].rolling(window=200).mean().iloc[-1]
                 vol_ratio = hist['Volume'].iloc[-1] / hist['Volume'].rolling(window=50).mean().iloc[-1]
+                # New factor metrics
+                factors = compute_factor_metrics(hist)
                 
                 fundamental_data = f"P/E: {round(pe, 2) if not np.isnan(pe) else 'N/A'}, PEG: {round(peg, 2) if not np.isnan(peg) else 'N/A'}, Debt/Equity: {round(debt_equity, 2) if not np.isnan(debt_equity) else 'N/A'}, ROE: {round(roe, 2) if not np.isnan(roe) else 'N/A'}, Dividend Yield: {round(dividend_yield, 2) if not np.isnan(dividend_yield) else 'N/A'}, Revenue Growth: {round(revenue_growth, 2) if not np.isnan(revenue_growth) else 'N/A'}"
                 technical_data = f"RSI: {round(rsi_val, 0)}, MACD: {round(macd_val, 2)}, SMA200: {round(sma200, 2)}, Volume vs SMA50: {round(vol_ratio, 0)}"
@@ -400,7 +536,14 @@ def analyze_stocks(tickers, status_placeholder, progress_bar):
                     'MACD Signal': macd_sig,
                     'Recommendation': rec,
                     'Price': round(current_price, 2),
-                    'TradingView Link': f"https://www.tradingview.com/chart/?symbol={ticker}"
+                    'TradingView Link': f"https://www.tradingview.com/chart/?symbol={ticker}",
+                    # New factors
+                    'Mom 12M': factors['Mom 12M'],
+                    'Mom 6M': factors['Mom 6M'],
+                    'Volatility (Ann)': factors['Volatility (Ann)'],
+                    'Max Drawdown': factors['Max Drawdown'],
+                    'ADV (20w)': factors['ADV (20w)'],
+                    '52W High %': factors['52W High %']
                 }
             except Exception as e:
                 status_placeholder.warning(f"Error computing scores for {ticker}: {e}")
@@ -414,6 +557,9 @@ def analyze_stocks(tickers, status_placeholder, progress_bar):
     
     if results:
         df = pd.DataFrame.from_dict(results, orient='index')
+        # Compute composite and strategy scores and refresh recommendations
+        df = compute_composite_scores(df)
+        df['Recommendation'] = df.apply(get_recommendation_v2, axis=1)
         df['Last Updated'] = pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')
         df.to_csv(CACHE_FILE, index_label='Ticker')
         return df
@@ -430,11 +576,15 @@ def load_cache():
                 'Sector', 'Fundamental Score', 'Fundamental Data', 'P/E Ratio', 'PEG Ratio', 'Debt/Equity', 'ROE',
                 'Dividend Yield', 'Revenue Growth', 'Technical Score', 'Technical Data', 'RSI', 'MACD', 'SMA200',
                 'Volume vs SMA50', 'UT Bot Signal', 'EMA 200 Signal', 'MACD Signal', 'Recommendation', 'Price',
-                'TradingView Link', 'Last Updated'
+                'TradingView Link', 'Mom 12M', 'Mom 6M', 'Volatility (Ann)', 'Max Drawdown', 'ADV (20w)', '52W High %',
+                'Score Value', 'Score Growth', 'Score Quality', 'Score Momentum', 'Score LowVol', 'Score Liquidity', 'Composite Score', 'Last Updated'
             ]
             for col in expected_columns:
                 if col not in df.columns:
-                    df[col] = np.nan if col in ['Fundamental Score', 'P/E Ratio', 'PEG Ratio', 'Debt/Equity', 'ROE', 'Dividend Yield', 'Revenue Growth', 'Technical Score', 'RSI', 'MACD', 'SMA200', 'Volume vs SMA50', 'Price'] else ''
+                    numeric_cols = ['Fundamental Score', 'P/E Ratio', 'PEG Ratio', 'Debt/Equity', 'ROE', 'Dividend Yield', 'Revenue Growth', 'Technical Score', 'RSI', 'MACD', 'SMA200', 'Volume vs SMA50', 'Price',
+                                    'Mom 12M', 'Mom 6M', 'Volatility (Ann)', 'Max Drawdown', 'ADV (20w)', '52W High %',
+                                    'Score Value', 'Score Growth', 'Score Quality', 'Score Momentum', 'Score LowVol', 'Score Liquidity', 'Composite Score']
+                    df[col] = np.nan if col in numeric_cols else ''
                     log_error(f"Added missing column {col} to cache")
             return df
         except Exception as e:
@@ -541,27 +691,33 @@ st.set_page_config(page_title="Stock Analysis & Paper Trading App", layout="wide
 st.markdown("""
     <style>
     .stApp {
-        background-color: #f0f2f6;
+        background-color: #0b1221;
+        color: #e5e7eb;
+        font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji";
     }
     .stButton>button {
-        background-color: #4CAF50;
+        background: linear-gradient(135deg, #2563eb, #7c3aed);
         color: white;
-        border-radius: 5px;
+        border-radius: 8px;
+        border: 0;
+        padding: 0.6rem 1rem;
+        font-weight: 600;
     }
     .stTextInput>div>input {
-        border-radius: 5px;
+        border-radius: 8px;
     }
     .stMetric {
-        background-color: #ffffff;
-        border-radius: 5px;
-        padding: 10px;
-        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        background-color: #111827;
+        border-radius: 10px;
+        padding: 12px;
+        box-shadow: 0 4px 10px rgba(0,0,0,0.3);
     }
     .sidebar .sidebar-content {
-        background-color: #ffffff;
-        border-radius: 5px;
+        background-color: #111827;
+        border-radius: 8px;
         padding: 10px;
     }
+    a { color: #93c5fd; }
     </style>
 """, unsafe_allow_html=True)
 
@@ -638,12 +794,21 @@ with st.sidebar.expander("Signal Filters", expanded=True):
     unique_macd = sorted(df['MACD Signal'].unique()) if 'MACD Signal' in df.columns else []
     selected_macd = st.multiselect("MACD Signals", unique_macd, default=unique_macd, key="macd_filter")
 
+with st.sidebar.expander("Strategy Presets", expanded=True):
+    preset = st.selectbox(
+        "Preset",
+        ["None","All-Rounder","Value","Growth","Quality","Momentum","Low Volatility","Liquidity"],
+        index=0,
+        key="strategy_preset"
+    )
+
 with st.sidebar.expander("Metric Filters", expanded=True):
     min_f_score, max_f_score = st.slider("Fundamental Score Range", 0.0, 10.0, (0.0, 10.0), key="f_score_filter")
     min_t_score, max_t_score = st.slider("Technical Score Range", 0.0, 10.0, (0.0, 10.0), key="t_score_filter")
     min_price, max_price = st.slider("Price Range (₹)", float(df['Price'].min()), float(df['Price'].max()), (float(df['Price'].min()), float(df['Price'].max())), key="price_filter")
     min_pe, max_pe = st.slider("P/E Ratio Range", float(df['P/E Ratio'].min()), float(df['P/E Ratio'].max()), (float(df['P/E Ratio'].min()), float(df['P/E Ratio'].max())), key="pe_filter") if 'P/E Ratio' in df.columns else (0.0, 100.0)
     min_rsi, max_rsi = st.slider("RSI Range", 0.0, 100.0, (0.0, 100.0), key="rsi_filter") if 'RSI' in df.columns else (0.0, 100.0)
+    min_comp, max_comp = st.slider("Composite Score Range", 0.0, 100.0, (0.0, 100.0), key="comp_filter") if 'Composite Score' in df.columns else (0.0, 100.0)
 
 # Apply filters
 filtered_df = df[
@@ -656,13 +821,15 @@ filtered_df = df[
     (df['Technical Score'].between(min_t_score, max_t_score)) &
     (df['Price'].between(min_price, max_price)) &
     (df['P/E Ratio'].between(min_pe, max_pe) if 'P/E Ratio' in df.columns else True) &
-    (df['RSI'].between(min_rsi, max_rsi) if 'RSI' in df.columns else True)
+    (df['RSI'].between(min_rsi, max_rsi) if 'RSI' in df.columns else True) &
+    (df['Composite Score'].between(min_comp, max_comp) if 'Composite Score' in df.columns else True)
 ]
 
 # Reorder columns for display
 display_columns = [
     'Sector', 'Fundamental Score', 'Fundamental Data', 'Technical Score', 'Technical Data',
-    'UT Bot Signal', 'EMA 200 Signal', 'MACD Signal', 'Recommendation', 'Price', 'TradingView Link'
+    'UT Bot Signal', 'EMA 200 Signal', 'MACD Signal', 'Recommendation', 'Price', 'TradingView Link',
+    'Composite Score'
 ]
 available_columns = [col for col in display_columns if col in filtered_df.columns]
 if len(available_columns) < len(display_columns):
@@ -686,6 +853,28 @@ styled_df = filtered_df_display.style.format({
     'TradingView Link': make_clickable
 })
 st.write(styled_df, unsafe_allow_html=True)
+
+# Top Picks based on preset
+score_map = {
+    'All-Rounder': 'Composite Score',
+    'Value': 'Score Value',
+    'Growth': 'Score Growth',
+    'Quality': 'Score Quality',
+    'Momentum': 'Score Momentum',
+    'Low Volatility': 'Score LowVol',
+    'Liquidity': 'Score Liquidity'
+}
+if preset != "None":
+    score_col = score_map.get(preset, 'Composite Score')
+    if score_col in filtered_df.columns:
+        tech_confirm = (
+            (filtered_df['UT Bot Signal'].isin(['Buy','Bullish'])) &
+            (filtered_df['EMA 200 Signal'].isin(['Buy','Bullish'])) &
+            (filtered_df['Price'] >= filtered_df['SMA200'])
+        )
+        top_df = filtered_df[tech_confirm].sort_values(by=score_col, ascending=False).head(15)
+        st.subheader(f"Top Picks: {preset}")
+        st.write(top_df[[c for c in ['Sector','Price','Composite Score','Score Value','Score Growth','Score Quality','Score Momentum','Score LowVol','Score Liquidity','TradingView Link'] if c in top_df.columns]].style.format({'Price': f'{CURRENCY_SYMBOL}{{:.2f}}', 'TradingView Link': make_clickable}), unsafe_allow_html=True)
 
 # Ticker details and paper trading
 st.subheader("Select Ticker for Details and Trading")
@@ -819,7 +1008,7 @@ st.download_button(
 # Footer
 st.markdown("---")
 st.markdown(f"""
-    **Note:** Uses yfinance for 5-year weekly data. Fundamentals are sector-adjusted. UT Bot uses a=3. Run with `streamlit run app.py`. Data cached in 'analysis_cache.csv'.
+    **Note:** Uses yfinance for 5-year weekly data. Fundamentals are sector-adjusted. UT Bot uses a=3. Run with `streamlit run App.py`. Data cached in 'analysis_cache.csv'.
     **Warning:** Processing 752 tickers may hit rate limits. Check error_log.txt for issues. Reduce ticker count or use an alternative API (e.g., Alpha Vantage) if errors occur.
     **Developed by:** Your Name | Last Updated: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')}
 """)
