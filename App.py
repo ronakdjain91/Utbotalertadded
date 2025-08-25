@@ -15,6 +15,19 @@ ERROR_LOG_FILE = 'error_log.txt'
 # Currency symbol
 CURRENCY_SYMBOL = '₹'
 
+# TradingView helpers
+def format_tradingview_symbol(ticker: str) -> str:
+    try:
+        if isinstance(ticker, str):
+            return ticker.replace('.NS', '')
+        return str(ticker)
+    except Exception:
+        return str(ticker)
+
+def build_tradingview_link(ticker: str) -> str:
+    sym = format_tradingview_symbol(ticker)
+    return f"https://www.tradingview.com/chart/?symbol={sym}"
+
 # Load tickers
 def load_tickers():
     if not os.path.exists(TICKERS_FILE):
@@ -541,7 +554,7 @@ def analyze_stocks(tickers, status_placeholder, progress_bar):
                     'MACD Signal': macd_sig,
                     'Recommendation': rec,
                     'Price': round(current_price, 2),
-                    'TradingView Link': f"https://www.tradingview.com/chart/?symbol={ticker}",
+                    'TradingView Link': build_tradingview_link(ticker),
                     # New factors
                     'Mom 12M': factors['Mom 12M'],
                     'Mom 6M': factors['Mom 6M'],
@@ -866,7 +879,13 @@ with overview_tab:
     if 'Composite Score' in data.columns:
         top_all = data.sort_values('Composite Score', ascending=False).head(10)
         st.markdown("**Top 10 All-Rounder Picks**")
-        st.dataframe(top_all[['Sector','Price','Composite Score','Score Quality','Score Momentum','Score Value','Score Growth']].style.format({'Price': f'{CURRENCY_SYMBOL}{{:.2f}}'}))
+        cols_top = [c for c in ['Sector','Price','Composite Score','Score Quality','Score Momentum','Score Value','Score Growth','TradingView Link'] if c in top_all.columns]
+        st.dataframe(
+            top_all[cols_top],
+            column_config={
+                'TradingView Link': st.column_config.LinkColumn("TradingView", display_text="Chart", width="small"),
+            }
+        )
 
 with matrix_tab:
     st.subheader("Strategy Matrix (which strategies each stock qualifies for)")
@@ -915,7 +934,17 @@ with backtest_tab:
 
 with full_tab:
     st.subheader("Complete Data")
-    st.dataframe(df)
+    # Move long text columns to the end and reduce their widths; make TradingView clickable
+    end_cols = [c for c in ['Fundamental Data','Technical Data'] if c in df.columns]
+    ordered_cols = [c for c in df.columns if c not in end_cols] + end_cols
+    st.dataframe(
+        df[ordered_cols],
+        column_config={
+            'TradingView Link': st.column_config.LinkColumn("TradingView", display_text="Chart", width="small"),
+            'Fundamental Data': st.column_config.TextColumn(width="small"),
+            'Technical Data': st.column_config.TextColumn(width="small"),
+        }
+    )
 
 with portfolio_tab:
     view_portfolio()
