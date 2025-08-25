@@ -841,6 +841,7 @@ with overview_tab:
     st.subheader("Strategy-wise Recommendations")
     # Recompute strategy flags with current thresholds
     data = df.copy()
+    st.metric("Tickers analyzed", len(data))
     flags_df = data.apply(qualify_strategies, axis=1, result_type='expand')
     if isinstance(flags_df, pd.DataFrame):
         for col in flags_df.columns:
