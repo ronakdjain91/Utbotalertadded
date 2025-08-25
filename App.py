@@ -198,6 +198,7 @@ def compute_factor_metrics(hist):
     # Momentum
     mom_12m = close.pct_change(52).iloc[-1] if len(close) >= 53 else np.nan
     mom_6m = close.pct_change(26).iloc[-1] if len(close) >= 27 else np.nan
+    mom_3m = close.pct_change(13).iloc[-1] if len(close) >= 14 else np.nan
     # Volatility (annualized from weekly returns over 52 weeks)
     weekly_rets = close.pct_change().dropna()
     vol_ann = weekly_rets.tail(52).std() * np.sqrt(52) if len(weekly_rets) > 0 else np.nan
@@ -211,6 +212,7 @@ def compute_factor_metrics(hist):
     return {
         'Mom 12M': float(mom_12m) if mom_12m is not None else np.nan,
         'Mom 6M': float(mom_6m) if mom_6m is not None else np.nan,
+        'Mom 3M': float(mom_3m) if mom_3m is not None else np.nan,
         'Volatility (Ann)': float(vol_ann) if vol_ann is not None else np.nan,
         'Max Drawdown': float(mdd) if mdd is not None else np.nan,
         'ADV (20w)': float(adv_20w) if adv_20w is not None else np.nan,
@@ -543,6 +545,7 @@ def analyze_stocks(tickers, status_placeholder, progress_bar):
                     # New factors
                     'Mom 12M': factors['Mom 12M'],
                     'Mom 6M': factors['Mom 6M'],
+                    'Mom 3M': factors['Mom 3M'],
                     'Volatility (Ann)': factors['Volatility (Ann)'],
                     'Max Drawdown': factors['Max Drawdown'],
                     'ADV (20w)': factors['ADV (20w)'],
@@ -585,7 +588,7 @@ def load_cache():
                 'Sector', 'Fundamental Score', 'Fundamental Data', 'P/E Ratio', 'PEG Ratio', 'Debt/Equity', 'ROE',
                 'Dividend Yield', 'Revenue Growth', 'Technical Score', 'Technical Data', 'RSI', 'MACD', 'SMA200',
                 'Volume vs SMA50', 'UT Bot Signal', 'EMA 200 Signal', 'MACD Signal', 'Recommendation', 'Price',
-                'TradingView Link', 'Mom 12M', 'Mom 6M', 'Volatility (Ann)', 'Max Drawdown', 'ADV (20w)', '52W High %',
+                'TradingView Link', 'Mom 12M', 'Mom 6M', 'Mom 3M', 'Volatility (Ann)', 'Max Drawdown', 'ADV (20w)', '52W High %',
                 'Score Value', 'Score Growth', 'Score Quality', 'Score Momentum', 'Score LowVol', 'Score Liquidity', 'Composite Score', 'QTD Return',
                 'Qualifies Value', 'Qualifies Growth', 'Qualifies Quality', 'Qualifies Momentum', 'Qualifies LowVol', 'Qualifies Liquidity', 'Qualifies All-Rounder',
                 'Last Updated'
@@ -593,7 +596,7 @@ def load_cache():
             for col in expected_columns:
                 if col not in df.columns:
                     numeric_cols = ['Fundamental Score', 'P/E Ratio', 'PEG Ratio', 'Debt/Equity', 'ROE', 'Dividend Yield', 'Revenue Growth', 'Technical Score', 'RSI', 'MACD', 'SMA200', 'Volume vs SMA50', 'Price',
-                                    'Mom 12M', 'Mom 6M', 'Volatility (Ann)', 'Max Drawdown', 'ADV (20w)', '52W High %',
+                                    'Mom 12M', 'Mom 6M', 'Mom 3M', 'Volatility (Ann)', 'Max Drawdown', 'ADV (20w)', '52W High %',
                                     'Score Value', 'Score Growth', 'Score Quality', 'Score Momentum', 'Score LowVol', 'Score Liquidity', 'Composite Score']
                     df[col] = np.nan if col in numeric_cols else ''
                     log_error(f"Added missing column {col} to cache")
@@ -709,21 +712,43 @@ def compute_qtd_return(hist):
         return np.nan
 
 
+# Threshold settings helpers
+
+def get_strategy_thresholds():
+    defaults = {
+        'thr_value': 60,
+        'thr_growth': 60,
+        'thr_quality': 60,
+        'thr_momentum': 60,
+        'thr_lowvol': 60,
+        'thr_liquidity': 60,
+        'thr_allrounder': 70,
+        'require_bullish': True,
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+    return {k: st.session_state[k] for k in defaults.keys()}
+
+
 def qualify_strategies(row):
     flags = {}
+    thr = get_strategy_thresholds()
     price = row.get('Price', np.nan)
     sma200 = row.get('SMA200', np.nan)
     ut = row.get('UT Bot Signal', 'Neutral')
     ema = row.get('EMA 200 Signal', 'Neutral')
-    bullish = (ut in ['Buy','Bullish']) and (ema in ['Buy','Bullish']) and (not np.isnan(price) and not np.isnan(sma200) and price >= sma200)
+    bullish = True
+    if thr.get('require_bullish', True):
+        bullish = (ut in ['Buy','Bullish']) and (ema in ['Buy','Bullish']) and (not np.isnan(price) and not np.isnan(sma200) and price >= sma200)
     # Thresholds
-    flags['Qualifies Value'] = (row.get('Score Value', 0) >= 60) and bullish
-    flags['Qualifies Growth'] = (row.get('Score Growth', 0) >= 60) and bullish
-    flags['Qualifies Quality'] = (row.get('Score Quality', 0) >= 60) and bullish
-    flags['Qualifies Momentum'] = (row.get('Score Momentum', 0) >= 60) and bullish
-    flags['Qualifies LowVol'] = (row.get('Score LowVol', 0) >= 60) and bullish
-    flags['Qualifies Liquidity'] = (row.get('Score Liquidity', 0) >= 60) and bullish
-    flags['Qualifies All-Rounder'] = (row.get('Composite Score', 0) >= 70) and bullish
+    flags['Qualifies Value'] = (row.get('Score Value', 0) >= thr.get('thr_value', 60)) and bullish
+    flags['Qualifies Growth'] = (row.get('Score Growth', 0) >= thr.get('thr_growth', 60)) and bullish
+    flags['Qualifies Quality'] = (row.get('Score Quality', 0) >= thr.get('thr_quality', 60)) and bullish
+    flags['Qualifies Momentum'] = (row.get('Score Momentum', 0) >= thr.get('thr_momentum', 60)) and bullish
+    flags['Qualifies LowVol'] = (row.get('Score LowVol', 0) >= thr.get('thr_lowvol', 60)) and bullish
+    flags['Qualifies Liquidity'] = (row.get('Score Liquidity', 0) >= thr.get('thr_liquidity', 60)) and bullish
+    flags['Qualifies All-Rounder'] = (row.get('Composite Score', 0) >= thr.get('thr_allrounder', 70)) and bullish
     return flags
 
 # Main Streamlit App
@@ -801,15 +826,20 @@ if st.sidebar.button("🔄 Refresh Data"):
         st.error("Analysis failed. Check error_log.txt for details.")
 
 # Tabs
-overview_tab, matrix_tab, full_tab, portfolio_tab = st.tabs(["Overview","Strategy Matrix","Full Data","Portfolio"])
+overview_tab, matrix_tab, backtest_tab, full_tab, portfolio_tab, settings_tab = st.tabs(["Overview","Strategy Matrix","Backtest","Full Data","Portfolio","Settings"])
 
 with overview_tab:
     st.subheader("Strategy-wise Recommendations")
-    # Count buys per strategy based on qualification flags
-    strategy_cols = [c for c in df.columns if c.startswith('Qualifies ')]
+    # Recompute strategy flags with current thresholds
+    data = df.copy()
+    flags_df = data.apply(qualify_strategies, axis=1, result_type='expand')
+    if isinstance(flags_df, pd.DataFrame):
+        for col in flags_df.columns:
+            data[col] = flags_df[col]
+    strategy_cols = [c for c in data.columns if c.startswith('Qualifies ')]
     counts = []
     for c in strategy_cols:
-        counts.append({"Strategy": c.replace('Qualifies ', ''), "Buys": int(df[c].fillna(False).sum())})
+        counts.append({"Strategy": c.replace('Qualifies ', ''), "Buys": int(data[c].fillna(False).sum())})
     if counts:
         chart_df = pd.DataFrame(counts)
         fig = go.Figure(data=[go.Bar(x=chart_df['Strategy'], y=chart_df['Buys'], marker_color="#22c55e")])
@@ -817,30 +847,61 @@ with overview_tab:
         st.plotly_chart(fig, use_container_width=True)
     # Sector QTD performance
     st.markdown("**Sector QTD Performance**")
-    if 'QTD Return' in df.columns and 'Sector' in df.columns:
-        sector_qtd = df.groupby('Sector')['QTD Return'].median().sort_values(ascending=False)
+    if 'QTD Return' in data.columns and 'Sector' in data.columns:
+        sector_qtd = data.groupby('Sector')['QTD Return'].median().sort_values(ascending=False)
         booming_sector = sector_qtd.index[0] if len(sector_qtd) else 'N/A'
         st.metric("Booming Sector (QTD median)", booming_sector)
         st.dataframe(sector_qtd.reset_index().rename(columns={'QTD Return':'QTD Median'}))
     # Top 10 All-Rounder picks
-    if 'Composite Score' in df.columns:
-        top_all = df.sort_values('Composite Score', ascending=False).head(10)
+    if 'Composite Score' in data.columns:
+        top_all = data.sort_values('Composite Score', ascending=False).head(10)
         st.markdown("**Top 10 All-Rounder Picks**")
         st.dataframe(top_all[['Sector','Price','Composite Score','Score Quality','Score Momentum','Score Value','Score Growth']].style.format({'Price': f'{CURRENCY_SYMBOL}{{:.2f}}'}))
 
 with matrix_tab:
     st.subheader("Strategy Matrix (which strategies each stock qualifies for)")
-    show_only_bullish = st.checkbox("Show only bullish (UT/EMA + above SMA200)", value=True)
+    show_only_bullish = st.checkbox("Show only bullish (UT/EMA + above SMA200)", value=True, key="matrix_bullish")
     data = df.copy()
+    flags_df = data.apply(qualify_strategies, axis=1, result_type='expand')
+    if isinstance(flags_df, pd.DataFrame):
+        for col in flags_df.columns:
+            data[col] = flags_df[col]
     if show_only_bullish:
         cond = (data['UT Bot Signal'].isin(['Buy','Bullish'])) & (data['EMA 200 Signal'].isin(['Buy','Bullish'])) & (data['Price'] >= data['SMA200'])
         data = data[cond]
     matrix_cols = ['Qualifies All-Rounder','Qualifies Value','Qualifies Growth','Qualifies Quality','Qualifies Momentum','Qualifies LowVol','Qualifies Liquidity']
     present_cols = [c for c in matrix_cols if c in data.columns]
     table = data[present_cols].fillna(False).astype(bool)
-    # Convert booleans to ✓/✗
     table = table.replace({True: '✓', False: '✗'})
     st.dataframe(table)
+
+with backtest_tab:
+    st.subheader("Cohort Performance (Strategy vs Universe)")
+    data = df.copy()
+    flags_df = data.apply(qualify_strategies, axis=1, result_type='expand')
+    if isinstance(flags_df, pd.DataFrame):
+        for col in flags_df.columns:
+            data[col] = flags_df[col]
+    strategy_cols = ['Qualifies All-Rounder','Qualifies Value','Qualifies Growth','Qualifies Quality','Qualifies Momentum','Qualifies LowVol','Qualifies Liquidity']
+    periods = [('Mom 3M','3M'), ('Mom 6M','6M'), ('Mom 12M','12M')]
+    for metric, label in periods:
+        if metric not in data.columns:
+            continue
+        universe_median = float(pd.to_numeric(data[metric], errors='coerce').median()) if len(data) else np.nan
+        rows = []
+        for col in strategy_cols:
+            if col in data.columns:
+                subset = data[data[col] == True]
+                med = float(pd.to_numeric(subset[metric], errors='coerce').median()) if len(subset) else np.nan
+                rows.append({'Strategy': col.replace('Qualifies ', ''), 'Median Return': med})
+        if rows:
+            chart_df = pd.DataFrame(rows)
+            fig = go.Figure()
+            fig.add_trace(go.Bar(x=chart_df['Strategy'], y=chart_df['Median Return'], name=f"Strategy {label}", marker_color="#38bdf8"))
+            if not np.isnan(universe_median):
+                fig.add_trace(go.Scatter(x=chart_df['Strategy'], y=[universe_median]*len(chart_df), name="Universe Median", mode='lines', line=dict(color="#f43f5e", dash='dash')))
+            fig.update_layout(title=f"Median {label} Return", template='plotly_white', height=360)
+            st.plotly_chart(fig, use_container_width=True)
 
 with full_tab:
     st.subheader("Complete Data")
@@ -849,7 +910,22 @@ with full_tab:
 with portfolio_tab:
     view_portfolio()
 
-# Remove old Visual Insights (sector charts) and old filter table sections
+with settings_tab:
+    st.subheader("Strategy Thresholds & Signals")
+    thr = get_strategy_thresholds()
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.session_state['thr_value'] = st.slider("Value threshold", 0, 100, thr['thr_value'])
+        st.session_state['thr_quality'] = st.slider("Quality threshold", 0, 100, thr['thr_quality'])
+    with c2:
+        st.session_state['thr_growth'] = st.slider("Growth threshold", 0, 100, thr['thr_growth'])
+        st.session_state['thr_momentum'] = st.slider("Momentum threshold", 0, 100, thr['thr_momentum'])
+    with c3:
+        st.session_state['thr_lowvol'] = st.slider("LowVol threshold", 0, 100, thr['thr_lowvol'])
+        st.session_state['thr_liquidity'] = st.slider("Liquidity threshold", 0, 100, thr['thr_liquidity'])
+    st.session_state['thr_allrounder'] = st.slider("All-Rounder Composite threshold", 0, 100, thr['thr_allrounder'])
+    st.session_state['require_bullish'] = st.checkbox("Require bullish confirmation (UT/EMA + price ≥ SMA200)", value=thr['require_bullish'])
+    st.info("Thresholds apply immediately to the Strategy Matrix and Overview counts.")
 
 # Download option
 st.download_button(
