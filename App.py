@@ -512,6 +512,9 @@ def analyze_stocks(tickers, status_placeholder, progress_bar):
                 # New factor metrics
                 factors = compute_factor_metrics(hist)
                 
+                # QTD return
+                qtd_ret = compute_qtd_return(hist)
+                
                 fundamental_data = f"P/E: {round(pe, 2) if not np.isnan(pe) else 'N/A'}, PEG: {round(peg, 2) if not np.isnan(peg) else 'N/A'}, Debt/Equity: {round(debt_equity, 2) if not np.isnan(debt_equity) else 'N/A'}, ROE: {round(roe, 2) if not np.isnan(roe) else 'N/A'}, Dividend Yield: {round(dividend_yield, 2) if not np.isnan(dividend_yield) else 'N/A'}, Revenue Growth: {round(revenue_growth, 2) if not np.isnan(revenue_growth) else 'N/A'}"
                 technical_data = f"RSI: {round(rsi_val, 0)}, MACD: {round(macd_val, 2)}, SMA200: {round(sma200, 2)}, Volume vs SMA50: {round(vol_ratio, 0)}"
                 
@@ -543,7 +546,8 @@ def analyze_stocks(tickers, status_placeholder, progress_bar):
                     'Volatility (Ann)': factors['Volatility (Ann)'],
                     'Max Drawdown': factors['Max Drawdown'],
                     'ADV (20w)': factors['ADV (20w)'],
-                    '52W High %': factors['52W High %']
+                    '52W High %': factors['52W High %'],
+                    'QTD Return': qtd_ret
                 }
             except Exception as e:
                 status_placeholder.warning(f"Error computing scores for {ticker}: {e}")
@@ -560,6 +564,11 @@ def analyze_stocks(tickers, status_placeholder, progress_bar):
         # Compute composite and strategy scores and refresh recommendations
         df = compute_composite_scores(df)
         df['Recommendation'] = df.apply(get_recommendation_v2, axis=1)
+        # Strategy flags
+        flags_df = df.apply(qualify_strategies, axis=1, result_type='expand')
+        if isinstance(flags_df, pd.DataFrame):
+            for col in flags_df.columns:
+                df[col] = flags_df[col]
         df['Last Updated'] = pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')
         df.to_csv(CACHE_FILE, index_label='Ticker')
         return df
@@ -577,7 +586,9 @@ def load_cache():
                 'Dividend Yield', 'Revenue Growth', 'Technical Score', 'Technical Data', 'RSI', 'MACD', 'SMA200',
                 'Volume vs SMA50', 'UT Bot Signal', 'EMA 200 Signal', 'MACD Signal', 'Recommendation', 'Price',
                 'TradingView Link', 'Mom 12M', 'Mom 6M', 'Volatility (Ann)', 'Max Drawdown', 'ADV (20w)', '52W High %',
-                'Score Value', 'Score Growth', 'Score Quality', 'Score Momentum', 'Score LowVol', 'Score Liquidity', 'Composite Score', 'Last Updated'
+                'Score Value', 'Score Growth', 'Score Quality', 'Score Momentum', 'Score LowVol', 'Score Liquidity', 'Composite Score', 'QTD Return',
+                'Qualifies Value', 'Qualifies Growth', 'Qualifies Quality', 'Qualifies Momentum', 'Qualifies LowVol', 'Qualifies Liquidity', 'Qualifies All-Rounder',
+                'Last Updated'
             ]
             for col in expected_columns:
                 if col not in df.columns:
@@ -684,6 +695,37 @@ def sell_stock(ticker, shares):
         st.error(f"Error selling {ticker}: {e}")
         log_error(f"Error selling {ticker}: {e}")
 
+def compute_qtd_return(hist):
+    try:
+        last_date = hist.index[-1]
+        quarter_start_month = ((last_date.month - 1)//3)*3 + 1
+        quarter_start = pd.Timestamp(year=last_date.year, month=quarter_start_month, day=1)
+        # find first trading point on/after quarter_start
+        idx = hist.index.get_indexer([quarter_start], method='bfill')[0]
+        start_price = hist['Close'].iloc[idx]
+        end_price = hist['Close'].iloc[-1]
+        return float((end_price / start_price) - 1.0) if start_price and start_price != 0 else np.nan
+    except Exception:
+        return np.nan
+
+
+def qualify_strategies(row):
+    flags = {}
+    price = row.get('Price', np.nan)
+    sma200 = row.get('SMA200', np.nan)
+    ut = row.get('UT Bot Signal', 'Neutral')
+    ema = row.get('EMA 200 Signal', 'Neutral')
+    bullish = (ut in ['Buy','Bullish']) and (ema in ['Buy','Bullish']) and (not np.isnan(price) and not np.isnan(sma200) and price >= sma200)
+    # Thresholds
+    flags['Qualifies Value'] = (row.get('Score Value', 0) >= 60) and bullish
+    flags['Qualifies Growth'] = (row.get('Score Growth', 0) >= 60) and bullish
+    flags['Qualifies Quality'] = (row.get('Score Quality', 0) >= 60) and bullish
+    flags['Qualifies Momentum'] = (row.get('Score Momentum', 0) >= 60) and bullish
+    flags['Qualifies LowVol'] = (row.get('Score LowVol', 0) >= 60) and bullish
+    flags['Qualifies Liquidity'] = (row.get('Score Liquidity', 0) >= 60) and bullish
+    flags['Qualifies All-Rounder'] = (row.get('Composite Score', 0) >= 70) and bullish
+    return flags
+
 # Main Streamlit App
 st.set_page_config(page_title="Stock Analysis & Paper Trading App", layout="wide")
 
@@ -746,263 +788,76 @@ if cached_df is not None:
     last_updated = cached_df['Last Updated'].iloc[0] if 'Last Updated' in cached_df.columns else "Unknown"
     st.info(f"Showing cached data (last updated: {last_updated}). Click 'Refresh Data' to update.")
 
-# Refresh button
-if st.button("🔄 Refresh Data"):
+# Sidebar no longer uses global filters; provide quick actions instead
+st.sidebar.header("⚙️ Actions")
+st.sidebar.write("Use tabs below to explore. Refresh data when needed.")
+if st.sidebar.button("🔄 Refresh Data"):
     status_placeholder.info("Processing data... UI will be unresponsive until complete.")
-    df = analyze_stocks(tickers, status_placeholder, progress_bar)
-    if df is not None:
-        st.session_state.df = df
+    df_ref = analyze_stocks(tickers, status_placeholder, progress_bar)
+    if df_ref is not None:
+        st.session_state.df = df_ref
+        st.experimental_rerun()
     else:
         st.error("Analysis failed. Check error_log.txt for details.")
 
-# Load data
-if 'df' in st.session_state:
-    df = st.session_state.df
-elif cached_df is not None:
-    df = cached_df
-else:
-    st.info("No data available. Click 'Refresh Data' to analyze stocks.")
-    st.stop()
+# Tabs
+overview_tab, matrix_tab, full_tab, portfolio_tab = st.tabs(["Overview","Strategy Matrix","Full Data","Portfolio"])
 
-# Cache expiration check
-if 'Last Updated' in df.columns:
-    try:
-        cache_age = (pd.Timestamp.now() - pd.to_datetime(df['Last Updated'].iloc[0])).total_seconds() / 3600
-        if cache_age > 24:
-            st.warning("Cached data is over 24 hours old. Please refresh.")
-    except Exception as e:
-        log_error(f"Error checking cache age: {e}")
-        st.warning("Invalid cache timestamp. Please refresh data.")
+with overview_tab:
+    st.subheader("Strategy-wise Recommendations")
+    # Count buys per strategy based on qualification flags
+    strategy_cols = [c for c in df.columns if c.startswith('Qualifies ')]
+    counts = []
+    for c in strategy_cols:
+        counts.append({"Strategy": c.replace('Qualifies ', ''), "Buys": int(df[c].fillna(False).sum())})
+    if counts:
+        chart_df = pd.DataFrame(counts)
+        fig = go.Figure(data=[go.Bar(x=chart_df['Strategy'], y=chart_df['Buys'], marker_color="#22c55e")])
+        fig.update_layout(title="Buy Counts by Strategy", template='plotly_white', height=360)
+        st.plotly_chart(fig, use_container_width=True)
+    # Sector QTD performance
+    st.markdown("**Sector QTD Performance**")
+    if 'QTD Return' in df.columns and 'Sector' in df.columns:
+        sector_qtd = df.groupby('Sector')['QTD Return'].median().sort_values(ascending=False)
+        booming_sector = sector_qtd.index[0] if len(sector_qtd) else 'N/A'
+        st.metric("Booming Sector (QTD median)", booming_sector)
+        st.dataframe(sector_qtd.reset_index().rename(columns={'QTD Return':'QTD Median'}))
+    # Top 10 All-Rounder picks
+    if 'Composite Score' in df.columns:
+        top_all = df.sort_values('Composite Score', ascending=False).head(10)
+        st.markdown("**Top 10 All-Rounder Picks**")
+        st.dataframe(top_all[['Sector','Price','Composite Score','Score Quality','Score Momentum','Score Value','Score Growth']].style.format({'Price': f'{CURRENCY_SYMBOL}{{:.2f}}'}))
 
-# Filters in sidebar
-st.sidebar.header("🔍 Filters")
-with st.sidebar.expander("Sector Filters", expanded=True):
-    unique_sectors = sorted(df['Sector'].unique())
-    selected_sectors = st.multiselect("Select Sectors", unique_sectors, default=unique_sectors, key="sector_filter")
+with matrix_tab:
+    st.subheader("Strategy Matrix (which strategies each stock qualifies for)")
+    show_only_bullish = st.checkbox("Show only bullish (UT/EMA + above SMA200)", value=True)
+    data = df.copy()
+    if show_only_bullish:
+        cond = (data['UT Bot Signal'].isin(['Buy','Bullish'])) & (data['EMA 200 Signal'].isin(['Buy','Bullish'])) & (data['Price'] >= data['SMA200'])
+        data = data[cond]
+    matrix_cols = ['Qualifies All-Rounder','Qualifies Value','Qualifies Growth','Qualifies Quality','Qualifies Momentum','Qualifies LowVol','Qualifies Liquidity']
+    present_cols = [c for c in matrix_cols if c in data.columns]
+    table = data[present_cols].fillna(False).astype(bool)
+    # Convert booleans to ✓/✗
+    table = table.replace({True: '✓', False: '✗'})
+    st.dataframe(table)
 
-with st.sidebar.expander("Signal Filters", expanded=True):
-    unique_recs = sorted(df['Recommendation'].unique())
-    default_recs = [rec for rec in ['Buy', 'Bullish'] if rec in unique_recs] or unique_recs
-    selected_recs = st.multiselect("Recommendations", unique_recs, default=default_recs, key="rec_filter")
-    
-    unique_ut = sorted(df['UT Bot Signal'].unique()) if 'UT Bot Signal' in df.columns else []
-    selected_ut = st.multiselect("UT Bot Signals", unique_ut, default=unique_ut, key="ut_filter")
-    
-    unique_ema = sorted(df['EMA 200 Signal'].unique()) if 'EMA 200 Signal' in df.columns else []
-    selected_ema = st.multiselect("EMA 200 Signals", unique_ema, default=unique_ema, key="ema_filter")
-    
-    unique_macd = sorted(df['MACD Signal'].unique()) if 'MACD Signal' in df.columns else []
-    selected_macd = st.multiselect("MACD Signals", unique_macd, default=unique_macd, key="macd_filter")
+with full_tab:
+    st.subheader("Complete Data")
+    st.dataframe(df)
 
-with st.sidebar.expander("Strategy Presets", expanded=True):
-    preset = st.selectbox(
-        "Preset",
-        ["None","All-Rounder","Value","Growth","Quality","Momentum","Low Volatility","Liquidity"],
-        index=0,
-        key="strategy_preset"
-    )
-
-with st.sidebar.expander("Metric Filters", expanded=True):
-    min_f_score, max_f_score = st.slider("Fundamental Score Range", 0.0, 10.0, (0.0, 10.0), key="f_score_filter")
-    min_t_score, max_t_score = st.slider("Technical Score Range", 0.0, 10.0, (0.0, 10.0), key="t_score_filter")
-    min_price, max_price = st.slider("Price Range (₹)", float(df['Price'].min()), float(df['Price'].max()), (float(df['Price'].min()), float(df['Price'].max())), key="price_filter")
-    min_pe, max_pe = st.slider("P/E Ratio Range", float(df['P/E Ratio'].min()), float(df['P/E Ratio'].max()), (float(df['P/E Ratio'].min()), float(df['P/E Ratio'].max())), key="pe_filter") if 'P/E Ratio' in df.columns else (0.0, 100.0)
-    min_rsi, max_rsi = st.slider("RSI Range", 0.0, 100.0, (0.0, 100.0), key="rsi_filter") if 'RSI' in df.columns else (0.0, 100.0)
-    min_comp, max_comp = st.slider("Composite Score Range", 0.0, 100.0, (0.0, 100.0), key="comp_filter") if 'Composite Score' in df.columns else (0.0, 100.0)
-
-# Apply filters
-filtered_df = df[
-    (df['Sector'].isin(selected_sectors)) &
-    (df['Recommendation'].isin(selected_recs)) &
-    (df['UT Bot Signal'].isin(selected_ut) if 'UT Bot Signal' in df.columns else True) &
-    (df['EMA 200 Signal'].isin(selected_ema) if 'EMA 200 Signal' in df.columns else True) &
-    (df['MACD Signal'].isin(selected_macd) if 'MACD Signal' in df.columns else True) &
-    (df['Fundamental Score'].between(min_f_score, max_f_score)) &
-    (df['Technical Score'].between(min_t_score, max_t_score)) &
-    (df['Price'].between(min_price, max_price)) &
-    (df['P/E Ratio'].between(min_pe, max_pe) if 'P/E Ratio' in df.columns else True) &
-    (df['RSI'].between(min_rsi, max_rsi) if 'RSI' in df.columns else True) &
-    (df['Composite Score'].between(min_comp, max_comp) if 'Composite Score' in df.columns else True)
-]
-
-# Reorder columns for display
-display_columns = [
-    'Sector', 'Fundamental Score', 'Fundamental Data', 'Technical Score', 'Technical Data',
-    'UT Bot Signal', 'EMA 200 Signal', 'MACD Signal', 'Recommendation', 'Price', 'TradingView Link',
-    'Composite Score'
-]
-available_columns = [col for col in display_columns if col in filtered_df.columns]
-if len(available_columns) < len(display_columns):
-    missing = [col for col in display_columns if col not in filtered_df.columns]
-    log_error(f"Missing columns in DataFrame: {missing}")
-    st.warning(f"Some columns are missing: {missing}. Click 'Refresh Data' to regenerate.")
-
-filtered_df_display = filtered_df[available_columns]
-
-# Display table
-st.subheader("Filtered Recommendations")
-def make_clickable(link):
-    if link:
-        return f'<a href="{link}" target="_blank">📊 Chart</a>'
-    return ''
-
-styled_df = filtered_df_display.style.format({
-    'Fundamental Score': '{:.2f}',
-    'Technical Score': '{:.2f}',
-    'Price': f'{CURRENCY_SYMBOL}{{:.2f}}',
-    'TradingView Link': make_clickable
-})
-st.write(styled_df, unsafe_allow_html=True)
-
-# Top Picks based on preset
-score_map = {
-    'All-Rounder': 'Composite Score',
-    'Value': 'Score Value',
-    'Growth': 'Score Growth',
-    'Quality': 'Score Quality',
-    'Momentum': 'Score Momentum',
-    'Low Volatility': 'Score LowVol',
-    'Liquidity': 'Score Liquidity'
-}
-if preset != "None":
-    score_col = score_map.get(preset, 'Composite Score')
-    if score_col in filtered_df.columns:
-        tech_confirm = (
-            (filtered_df['UT Bot Signal'].isin(['Buy','Bullish'])) &
-            (filtered_df['EMA 200 Signal'].isin(['Buy','Bullish'])) &
-            (filtered_df['Price'] >= filtered_df['SMA200'])
-        )
-        top_df = filtered_df[tech_confirm].sort_values(by=score_col, ascending=False).head(15)
-        st.subheader(f"Top Picks: {preset}")
-        st.write(top_df[[c for c in ['Sector','Price','Composite Score','Score Value','Score Growth','Score Quality','Score Momentum','Score LowVol','Score Liquidity','TradingView Link'] if c in top_df.columns]].style.format({'Price': f'{CURRENCY_SYMBOL}{{:.2f}}', 'TradingView Link': make_clickable}), unsafe_allow_html=True)
-
-# Ticker details and paper trading
-st.subheader("Select Ticker for Details and Trading")
-selected_ticker = st.selectbox("Select Ticker", options=[''] + list(filtered_df.index), index=0)
-
-if selected_ticker:
-    with st.expander(f"Details for {selected_ticker}", expanded=True):
-        row = filtered_df.loc[selected_ticker]
-        st.write("**Fundamental Metrics**")
-        st.write(f"- Fundamental Score: {row['Fundamental Score']:.2f}")
-        st.write(f"- {row['Fundamental Data']}")
-        st.write("**Technical Metrics**")
-        st.write(f"- Technical Score: {row['Technical Score']:.2f}")
-        st.write(f"- {row['Technical Data']}")
-        st.write(f"- UT Bot Signal: {row['UT Bot Signal']}")
-        st.write(f"- EMA 200 Signal: {row['EMA 200 Signal']}")
-        st.write(f"- MACD Signal: {row['MACD Signal']}")
-        st.write(f"- Recommendation: {row['Recommendation']}")
-        st.write(f"- Price: {CURRENCY_SYMBOL}{row['Price']:.2f}")
-        if row['TradingView Link']:
-            st.markdown(f"[View on TradingView]({row['TradingView Link']})")
-        
-        # Price chart
-        try:
-            hist = yf.Ticker(selected_ticker).history(period='1y')
-            fig = go.Figure(data=[go.Candlestick(
-                x=hist.index,
-                open=hist['Open'],
-                high=hist['High'],
-                low=hist['Low'],
-                close=hist['Close']
-            )])
-            fig.update_layout(
-                title=f"{selected_ticker} 1-Year Price Chart",
-                xaxis_title="Date",
-                yaxis_title=f"Price ({CURRENCY_SYMBOL})",
-                xaxis_rangeslider_visible=True,
-                template='plotly_white',
-                height=400
-            )
-            st.plotly_chart(fig, use_container_width=True)
-        except Exception as e:
-            st.warning(f"Error fetching chart for {selected_ticker}: {e}")
-            log_error(f"Error fetching chart for {selected_ticker}: {e}")
-        
-        # Buy/Sell forms
-        st.subheader("Trade")
-        col1, col2 = st.columns(2)
-        with col1:
-            buy_shares = st.number_input("Shares to Buy", min_value=1.0, step=1.0, key=f"buy_shares_{selected_ticker}")
-            if st.button("Buy", key=f"buy_{selected_ticker}"):
-                buy_stock(selected_ticker, buy_shares)
-                st.experimental_rerun()
-        with col2:
-            sell_shares = st.number_input("Shares to Sell", min_value=1.0, step=1.0, key=f"sell_shares_{selected_ticker}")
-            if st.button("Sell", key=f"sell_{selected_ticker}"):
-                sell_stock(selected_ticker, sell_shares)
-                st.experimental_rerun()
-
-# Visualizations
-with st.container():
-    st.subheader("📊 Visual Insights")
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.markdown("**Average Technical Score by Sector**")
-        tech_score_avg = filtered_df.groupby('Sector')['Technical Score'].mean().reset_index()
-        tech_score_avg['Technical Score'] = tech_score_avg['Technical Score'].round(2)
-        fig_tech = go.Figure(data=[
-            go.Bar(x=tech_score_avg['Sector'], y=tech_score_avg['Technical Score'], marker_color='#FF6F61')
-        ])
-        fig_tech.update_layout(
-            title="Average Technical Score",
-            xaxis_title="Sector",
-            yaxis_title="Score",
-            template='plotly_white',
-            height=400,
-            title_x=0.5,
-            hovermode='closest'
-        )
-        fig_tech.update_traces(hovertemplate='Sector: %{x}<br>Score: %{y:.2f}')
-        st.plotly_chart(fig_tech, use_container_width=True)
-    
-    with col2:
-        st.markdown("**Average Fundamental Score by Sector**")
-        fund_score_avg = filtered_df.groupby('Sector')['Fundamental Score'].mean().reset_index()
-        fund_score_avg['Fundamental Score'] = fund_score_avg['Fundamental Score'].round(2)
-        fig_fund = go.Figure(data=[
-            go.Bar(x=fund_score_avg['Sector'], y=fund_score_avg['Fundamental Score'], marker_color='#6B728E')
-        ])
-        fig_fund.update_layout(
-            title="Average Fundamental Score",
-            xaxis_title="Sector",
-            yaxis_title="Score",
-            template='plotly_white',
-            height=400,
-            title_x=0.5,
-            hovermode='closest'
-        )
-        fig_fund.update_traces(hovertemplate='Sector: %{x}<br>Score: %{y:.2f}')
-        st.plotly_chart(fig_fund, use_container_width=True)
-
-# Portfolio
-if st.button("💸 View Portfolio"):
+with portfolio_tab:
     view_portfolio()
 
-# Suggested Improvements for Screening Strategy
-st.subheader("📝 Suggested Improvements for Screening Strategy")
-st.markdown("""
-Based on historical data and successful strategies (2000-2025):
-- **Value Strategy**: Low P/E (<15), high ROE (>15%), low Debt/Equity (<1). Historical returns: ~17% annual (S&P 500 data, 2015-2025).
-- **Growth Strategy**: High revenue growth (>10%), high earnings growth (>15%). Historical returns: up to 113% in 2024 (tech-heavy portfolios).
-- **Momentum Strategy**: High ROE, growing revenues, positive technical signals (e.g., UT Bot 'Buy'). Zacks Big Money: 56.7% annual since 2000.
-- **CAN SLIM**: Growth stocks with strong fundamentals, momentum, and institutional support. Historical returns: ~13.8% annual.
-- **App Improvements**:
-  - Add **strategy preset buttons** (e.g., "Value", "Growth") to auto-apply filters like P/E < 15, Revenue Growth > 10%.
-  - Implement **backtesting module** using yfinance historical data to simulate strategies and display metrics (CAGR, Sharpe Ratio).
-  - Add **AI-based optimization** to suggest custom filters based on past performance.
-  - Include **portfolio performance tracking** with annualized returns and risk metrics.
-""")
+# Remove old Visual Insights (sector charts) and old filter table sections
 
 # Download option
 st.download_button(
     label="📥 Download CSV",
-    data=filtered_df.to_csv(),
+    data=df.to_csv(),
     file_name="recommendations.csv",
     mime="text/csv",
-    help="Download the filtered data as a CSV file"
+    help="Download the complete data as a CSV file"
 )
 
 # Footer
