@@ -813,6 +813,15 @@ if cached_df is not None:
     last_updated = cached_df['Last Updated'].iloc[0] if 'Last Updated' in cached_df.columns else "Unknown"
     st.info(f"Showing cached data (last updated: {last_updated}). Click 'Refresh Data' to update.")
 
+# Ensure df is available
+if 'df' in st.session_state:
+    df = st.session_state.df
+elif cached_df is not None:
+    df = cached_df
+else:
+    st.info("No data available. Click 'Refresh Data' to analyze stocks.")
+    st.stop()
+
 # Sidebar no longer uses global filters; provide quick actions instead
 st.sidebar.header("⚙️ Actions")
 st.sidebar.write("Use tabs below to explore. Refresh data when needed.")
@@ -860,7 +869,7 @@ with overview_tab:
 
 with matrix_tab:
     st.subheader("Strategy Matrix (which strategies each stock qualifies for)")
-    show_only_bullish = st.checkbox("Show only bullish (UT/EMA + above SMA200)", value=True, key="matrix_bullish")
+    show_only_bullish = st.checkbox("Show only bullish (UT/EMA + above SMA200)", value=False, key="matrix_bullish")
     data = df.copy()
     flags_df = data.apply(qualify_strategies, axis=1, result_type='expand')
     if isinstance(flags_df, pd.DataFrame):
